@@ -57,7 +57,30 @@ is **correctness-first, not speed-optimal** (no tensor cores on the gate yet). T
 fast path tiles a batch block so the gate becomes a tensor-core GEMM that reuses
 each streamed `P` tile — see the design note.
 
+## Status & next steps
+
+**Status:** forward-only; correctness-first. Written on a machine with no GPU and
+no `torch`, so **nothing here has been run yet** — the self-tests are unexecuted.
+
+To continue on a GPU box (in order):
+
+1. **CPU reference** — `python gist_pytorch.py` (needs `torch`). Confirms shapes
+   and the reference math.
+2. **Triton vs reference** — `python gist_triton.py` on CUDA. Confirms the fused
+   kernel matches to `< 1e-3`. The self-test uses `F=80` (not a multiple of
+   `BLOCK_G`) on purpose, to exercise the padded-`g` masking path.
+3. **Optimize the gate (the real work).** The current gate is a per-batch GEMV via
+   `tl.sum` with the `P` sub-tile register-resident — correct but slow (no tensor
+   cores). Make both stages `tl.dot` GEMMs and **tile a batch block** (`BLOCK_B >=
+   16` rows of `M`) so the gate becomes a tensor-core GEMM `M[BLOCK_B,F] @ P` that
+   reuses each streamed `P` tile across the batch. `P` (~0.6 GB, shared across all
+   `B`) is the dominant HBM traffic, so batch reuse is the main win. Optionally
+   split into the explicit two-grid form (cheap stats grid lands `M, rstd`, main
+   grid fuses gate × pool) — see Obsidian §4.
+
 ## Design note
 
 Full notation and the grid/loop derivation live in the personal Obsidian note
-*"A Notation for GPU Kernel and Layout Algebra"*, §4 (GIST).
+*"A Notation for GPU Kernel and Layout Algebra"*, §4 (GIST) — kept as the single
+source of truth, not duplicated here. (`obsidian-vault` repo; pull it alongside
+this one.)
