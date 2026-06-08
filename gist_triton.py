@@ -3,16 +3,17 @@
 Mirrors gist_pytorch.GIST but fuses the whole module into one kernel:
 
     O[b,q,d] = sum_g  sigma( sum_f' M[b,f'] P[f', q*F + g] )  *  N[b,g,d]
-                       \--------- gate L[b,q,g] ----------/      \-- LayerNorm --/
+                       \--------- gate L[b,q,g] ----------/      \-- RMSNorm --/
 
-    M[b,f] = mean_D(X[b,f,:])              # gate input == LayerNorm mean
-    N[b,g,d] = (X[b,g,d]-M[b,g])*rstd[b,g] # (* gamma + beta)
+    M[b,f]   = mean_D(X[b,f,:])              # gate input (mean over D)
+    N[b,g,d] = X[b,g,d]*rrms[b,g] * W[g,d]   # RMSNorm over D (no centering, no bias)
+               rrms[b,g] = rsqrt(mean_D(X[b,g,:]^2) + eps)
 
 Fusion wins vs the reference:
   * the gate L [B,Q,F] (~0.3G elems) is computed tile-by-tile on-chip and never
     written to HBM; sigmoid is fused into its epilogue;
-  * the LayerNorm output N [B,F,D] is recomputed on the fly, never materialized;
-  * M and rstd are the SAME reduction (mean == LayerNorm mean), computed once.
+  * the RMSNorm output N [B,F,D] is recomputed on the fly, never materialized;
+  * M (mean, the gate input) and rrms (the RMS scale) come from one pass over X's D axis.
 Only X and P are read; only O is written.
 
 Notation map (see the design note):  Xi[beta] = grid over batch ; Phi[rho] = the
@@ -44,11 +45,12 @@ import triton.language as tl
 
 @triton.jit
 def _gist_fwd(
-    X, P, M, R, GAMMA, BETA, O,          # pointers
+    X, P, M, R, W, O,                    # pointers
     B, Fdim, D, Q,                       # sizes (Fdim = F)
     sx_b, sx_f, sx_d,                    # X strides  [B,F,D]
     sp_f, sp_c,                          # P strides  [F, Q*F]   (P[f, q*F+g])
     sm_b, sm_f,                          # M, R strides [B,F]
+    sw_f, sw_d,                          # W strides  [F, D]   (RMSNorm weight)
     so_b, so_q, so_d,                    # O strides  [B,Q,D]
     HAS_AFFINE: tl.constexpr,
     BLOCK_Q: tl.constexpr,               # Q tile (hardware tiling of the whole Q axis)
@@ -90,22 +92,23 @@ def _gist_fwd(
         gate = tl.sigmoid(gate)
         L = tl.reshape(gate, (BLOCK_Q, BLOCK_G))                                              # [BQ, BG]
 
-        # ---- N (LayerNorm on the fly) for this g-block ----
+        # ---- N (RMSNorm on the fly) for this g-block: no centering, no bias ----
         gg = g0 + tl.arange(0, BLOCK_G)
         ggm = gg < Fdim
         x = tl.load(
             X + b * sx_b + gg[:, None] * sx_f + d[None, :] * sx_d,
             mask=ggm[:, None] & dm[None, :], other=0.0,
         ).to(tl.float32)                                                                      # [BG, D]
-        m_g = tl.load(M + b * sm_b + gg * sm_f, mask=ggm, other=0.0).to(tl.float32)           # [BG]
         r_g = tl.load(R + b * sm_b + gg * sm_f, mask=ggm, other=0.0).to(tl.float32)           # [BG]
-        n = (x - m_g[:, None]) * r_g[:, None]                                                 # [BG, D]
+        n = x * r_g[:, None]                                                                  # [BG, D]
         if HAS_AFFINE:
-            gam = tl.load(GAMMA + d, mask=dm, other=0.0).to(tl.float32)
-            bet = tl.load(BETA + d, mask=dm, other=0.0).to(tl.float32)
-            n = n * gam[None, :] + bet[None, :]
-        # zero padded g rows (g >= F): without this, affine leaves n = beta there,
-        # and L = sigmoid(0) = 0.5 for the padded cols -> 0.5*beta would leak into O.
+            w = tl.load(
+                W + gg[:, None] * sw_f + d[None, :] * sw_d,
+                mask=ggm[:, None] & dm[None, :], other=0.0,
+            ).to(tl.float32)                                                                  # [BG, D]
+            n = n * w
+        # padded g rows (g >= F) already give n = 0 (x and r load as 0 there); the
+        # explicit zero keeps O clean even if a future affine adds a bias term.
         n = tl.where(ggm[:, None], n, 0.0)
 
         # ---- O += L @ N  (pooling over g) ----
@@ -124,8 +127,7 @@ def _next_pow2(x: int) -> int:
 def gist_triton_forward(
     x: torch.Tensor,          # [B, F, D]
     proj_P: torch.Tensor,     # [F, Q*F]   (== nn.Linear(F, Q*F).weight.t())
-    gamma: torch.Tensor | None = None,   # [D]
-    beta: torch.Tensor | None = None,    # [D]
+    weight: torch.Tensor | None = None,   # RMSNorm weight [F, D]
     *,
     eps: float = 1e-5,
     BLOCK_Q: int = 16,   # >= 16 for tl.dot; keep BLOCK_Q*BLOCK_G modest (tl.sum gate is register-resident)
@@ -137,24 +139,24 @@ def gist_triton_forward(
     assert proj_P.shape[0] == Fdim and QF % Fdim == 0
     Q = QF // Fdim
 
-    # cheap stats (tiny [B,F]); M is ALSO the gate input
-    m = x.mean(dim=-1)                              # [B, F]
-    var = x.var(dim=-1, unbiased=False)            # [B, F]
-    r = torch.rsqrt(var + eps)                     # [B, F]
+    # cheap stats (tiny [B,F]): M is the gate input (mean over D); R is the RMS scale.
+    m = x.mean(dim=-1)                              # [B, F]  gate input
+    ms = x.pow(2).mean(dim=-1)                      # [B, F]  mean of squares
+    r = torch.rsqrt(ms + eps)                      # [B, F]  RMSNorm scale
 
-    has_affine = gamma is not None
+    has_affine = weight is not None
     if not has_affine:
-        gamma = x.new_zeros(1)
-        beta = x.new_zeros(1)
+        weight = x.new_zeros(1, 1)
 
     o = torch.empty((B, Q, D), device=x.device, dtype=x.dtype)
     grid = (B, triton.cdiv(Q, BLOCK_Q))
     _gist_fwd[grid](
-        x, proj_P, m, r, gamma, beta, o,
+        x, proj_P, m, r, weight, o,
         B, Fdim, D, Q,
         x.stride(0), x.stride(1), x.stride(2),
         proj_P.stride(0), proj_P.stride(1),
         m.stride(0), m.stride(1),
+        weight.stride(0), weight.stride(1),
         o.stride(0), o.stride(1), o.stride(2),
         HAS_AFFINE=has_affine,
         BLOCK_Q=BLOCK_Q, BLOCK_G=BLOCK_G, BLOCK_K=BLOCK_K,
@@ -182,7 +184,7 @@ if __name__ == "__main__":
     o_ref = ref(x)
     P = ref.proj.weight.t().contiguous()           # [F, Q*F]
     o_tri = gist_triton_forward(
-        x, P, ref.norm.weight, ref.norm.bias, eps=ref.norm.eps,
+        x, P, ref.norm.weight, eps=ref.norm.eps,
         BLOCK_Q=16, BLOCK_G=32, BLOCK_K=32,
     )
 
