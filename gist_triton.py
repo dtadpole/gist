@@ -1,4 +1,4 @@
-"""GIST (Gated Information Summary and Transformation) — fused Triton forward (forward only).
+r"""GIST (Gated Information Summary and Transformation) — fused Triton forward (forward only).
 
 Mirrors gist_pytorch.GIST but fuses the whole module into one kernel:
 
@@ -112,7 +112,7 @@ def _gist_fwd(
         n = tl.where(ggm[:, None], n, 0.0)
 
         # ---- O += L @ N  (pooling over g) ----
-        acc += tl.dot(L, n, out_dtype=tl.float32)                                             # [BQ, D]
+        acc += tl.dot(L, n, out_dtype=tl.float32, allow_tf32=False)                           # [BQ, D]
 
     # store O[b, q_block, :]
     q_abs = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
@@ -172,23 +172,29 @@ if __name__ == "__main__":
 
     assert torch.cuda.is_available(), "run on a CUDA box"
     torch.backends.cuda.matmul.allow_tf32 = False
-    torch.manual_seed(0)
     dev = "cuda"
 
-    # F=80 is NOT a multiple of BLOCK_G=32 -> exercises the padded-g masking path
-    # (would catch the affine-leak bug); all block dims >= 16 for tl.dot.
-    B, F, D, Q = 4, 80, 64, 16
-    ref = GIST(F, D, Q).to(dev).to(torch.float32)
-    x = torch.randn(B, F, D, device=dev, dtype=torch.float32)
+    def check(dtype, tol):
+        torch.manual_seed(0)
+        # F=80 is NOT a multiple of BLOCK_G=32 -> exercises the padded-g masking path
+        # (would catch the affine-leak bug); all block dims >= 16 for tl.dot.
+        B, F, D, Q = 4, 80, 64, 16
+        ref = GIST(F, D, Q).to(dev).to(dtype)
+        x = torch.randn(B, F, D, device=dev, dtype=dtype)
+        o_ref = ref(x)
+        P = ref.proj.weight.t().contiguous()           # [F, Q*F]
+        o_tri = gist_triton_forward(
+            x, P, ref.norm.weight, eps=ref.norm.eps,
+            BLOCK_Q=16, BLOCK_G=32, BLOCK_K=32,
+        )
+        err = (o_ref.float() - o_tri.float()).abs().max().item()
+        status = "OK  " if err < tol else "FAIL"
+        print(f"[{status}] {str(dtype):14s} max abs err = {err:.3e}  (tol {tol:.0e})")
+        assert err < tol, (dtype, err)
 
-    o_ref = ref(x)
-    P = ref.proj.weight.t().contiguous()           # [F, Q*F]
-    o_tri = gist_triton_forward(
-        x, P, ref.norm.weight, eps=ref.norm.eps,
-        BLOCK_Q=16, BLOCK_G=32, BLOCK_K=32,
-    )
-
-    err = (o_ref - o_tri).abs().max().item()
-    print(f"max abs err = {err:.3e}")
-    assert err < 1e-3, err
+    # fp32: true fp32 match (the pooling tl.dot uses allow_tf32=False).
+    # bf16: the kernel accumulates the gate and pool in fp32, so it diverges from
+    # the bf16 reference only at bf16's inherent precision (~1e-2), not a bug.
+    check(torch.float32, 1e-3)
+    check(torch.bfloat16, 2e-2)
     print("OK: Triton matches PyTorch reference")
