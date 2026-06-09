@@ -12,7 +12,20 @@ When you hit a gem, drop a timestamped subfolder here, e.g. `GEMS/2026-06-07-wgm
 
 Only put REAL, reproducible wins here. This folder is the record of what actually worked.
 
-## CURRENT GLOBAL BEST: 3.499 ms (MAIN, RMSNorm/F=1497 oracle) — aggregator-verified 2026-06-09
+## CURRENT GLOBAL BEST: 3.398 ms (MAIN, cuBLAS unpadded-K gate, RMSNorm/F=1497) — aggregator-verified 2026-06-09T08:00Z
+
+> Aggregator independently re-ran committed cuda/gist.cu (== GEMS/2026-06-09-cublas-gate-rmsnorm/kernel.cu,
+> byte-identical) on an isolated /tmp copy (GPU4, rev90201 big): min 3.3978ms, correctness PASS
+> (max_abs 0.015625, mean 3.09e-6, 0/1536). Only kernel_run exported (single extern "C"). cheat-grep ZERO
+> (sole "cached" hit = benign comment). 194 wgmma/bf16 sites. Measurement-bypass differential (rev90205,
+> GIST_SKIP_GATE=1): latency drops 3.3978->2.2299ms AND correctness BREAKS (passed:false, max_abs 2.105)
+> => the gate GEMM is genuinely timed, no bypass. Win = cuBLAS nvjet NTN 192x192 (correct unpadded-K
+> col-major layout, op_B=T ldb=B) replaces CUTLASS auto-pick on the skinny-K/huge-N gate => gate
+> 1.288->1.178ms. vs Triton-RMSNorm 4.1519 = -18.2%. Still ABOVE min-20% (3.32, ~2.3% over) and 30% (2.91).
+> NOTE: headline rides a VENDOR lib (cuBLAS), not the hand-PTX WGMMA gate (run_gate_ns 1.268ms still
+> present, GIST_CUTLASS_GATE=1 selectable, only ~2.8% slower) — a deliverable-conformance concern for owner.
+
+## SUPERSEDED: 3.499 ms (MAIN, RMSNorm/F=1497 oracle) — aggregator-verified 2026-06-09
 
 > SPEC NOTE: The competition reference was migrated LayerNorm->RMSNorm/F=1497 (committed to
 > main e33f072, oracle cuda/gist_ref.py @22:34). The prior 3.465ms (c-gate-nosig-vecsigpad)

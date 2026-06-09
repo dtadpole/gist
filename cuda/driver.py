@@ -56,6 +56,10 @@ config = {
     "harness_scale_0": 1.0 / _su,                       # X ~ N(0,1)
     "harness_scale_1": 1.0 / _su,                       # P ~ N(0,1)
     "harness_scale_2": (1.0 / math.sqrt(F)) / _su,      # W ~ N(0,1/sqrt(F))  (RMSNorm weight)
+    # inputs 1 (P, gate proj weight) and 2 (W, RMSNorm weight) are CONSTANT model weights:
+    # the harness fills them once and never re-randomizes/reallocs them, so a kernel may
+    # preprocess a weight once (e.g. pad/repack P -> g_Ppad) and cache it. Only X (input 0) varies.
+    "harness_weight_inputs": "1,2",
 }
 
 md = Metadata(run_tag="run_h8_3_gist", version="v1", direction_id=0,

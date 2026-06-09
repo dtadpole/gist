@@ -59,9 +59,10 @@ Latency via `triton.testing.do_bench` (min, L2-flush) on GPU 0 — the `cuda_exe
 | Triton-fast (`gist_triton_fast_forward`) | 4.19 ms |
 | **CUDA + inline PTX (hand-written)** | **2.64 ms** |
 
-The hand-written **CUDA+PTX kernel is the fastest — ~37 % faster than Triton-fast** (correct: max_abs
-0.0156, 0/1536 vs the RMSNorm reference). It's **three fused hand-written kernels**, each pinned to a
-different ceiling on this (throttled) box (~2.07 TB/s HBM, ~800 TFLOP/s bf16 tensor):
+The hand-written **CUDA+PTX kernel is the fastest — ~1.6× faster than PyTorch `torch.compile`** (2.64 vs
+4.26 ms) and Triton-fast (4.19 ms), ~4.8× vs eager (correct: max_abs 0.0156, 0/1536 vs the RMSNorm
+reference). It's **three fused hand-written kernels**, each pinned to a different ceiling on this
+(throttled) box (~2.07 TB/s HBM, ~800 TFLOP/s bf16 tensor):
 
 | kernel | time | bound | util |
 |---|---|---|---|
@@ -74,7 +75,7 @@ and the pool computes `N` inline (deletes the ~0.9 GB `N` round-trip). Triton in
 gate (~2.6 ms); `compile` pays ~1.85 ms of memory-bound glue.
 
 > **Caveat (weight prepack):** the gate uses a one-time prepacked padded `P` — valid because the weights
-> are static (the harness holds `P`, `W` constant). Triton's per-call path prepacks nothing, so the ~37 %
+> are static (the harness holds `P`, `W` constant). Triton's per-call path prepacks nothing, so the ~1.6×
 > is a production-mode (prepacked-weights) comparison. Repro:
 > `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`
 > (kernel snapshot: `GEMS/2026-06-09-gist-b-phase4-gate-padded-norepad/`).

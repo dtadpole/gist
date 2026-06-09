@@ -697,7 +697,7 @@ constexpr int HGP_S = 4, HGP_NCH = 4, HGP_CW = HG_BN / HGP_NCH;
 __global__ __launch_bounds__(384, 1)
 void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                          const __grid_constant__ CUtensorMap tmLc,
-                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp) {
+                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig) {
     const int TILE = 64 * 64;
     const int nM = B / HG_BM;
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
@@ -785,11 +785,6 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                     int lc = 8 * gg + (lane % 4) * 2;
                     float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
                     if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp) {   // PADDED output to g_SL[B,Q,Fp]: write 0 (not σ(0)=0.5) for the g>=F pad cols
-                        int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;   // tile is within one q (Fp%256==0)
-                        if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
-                        if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
-                    }
                     *(__nv_bfloat162*)&ch[r0 * HGP_CW + lc] = __floats2bfloat162_rn(a0, a1);
                     *(__nv_bfloat162*)&ch[r1 * HGP_CW + lc] = __floats2bfloat162_rn(b0, b1);
                 }
@@ -2356,21 +2351,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
             int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
             int pgrid = numSM;
             if (getenv("GIST_HGGRID")) pgrid = atoi(getenv("GIST_HGGRID"));
-            if (getenv("GIST_GATEPAD")) {
-                // PHASE 4: padded gate. M @ Pp (Pp = per-q-padded P[F,Q*Fp]) -> writes g_SL[B,Q,Fp] DIRECTLY
-                // (σ fused via tanh; pad cols g>=F masked to 0). No repad kernel. ~3% extra compute (N: QF->Q*Fp),
-                // NO remap (Fp=1536 multiple of the 64-col chunk => aligned store). k_ppad once (P is constant).
-                int dosig = getenv("GIST_FUSESIG") ? 1 : 0;
-                static const void* s_ppsrc = nullptr;
-                if (P != s_ppsrc) {                          // one-time weight prepack (harness holds P constant)
-                    k_ppad<<<(unsigned)((long)F * Q), 256, 0, stream>>>(P, g_Ppad, F, Q, QF, (long)Q * Fp, Fp);
-                    s_ppsrc = P;
-                }
-                static bool ap = false;
-                if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
-                int pgridp = pgrid;
-                k_gate_hand_persist<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, Fp);
-            } else if (getenv("GIST_PHASE1RAW")) {
+            if (getenv("GIST_PHASE1RAW")) {
                 // PHASE 1 (raw logits, no fusion): persistent gate -> g_L, then k_sigpad applies sigmoid+pad.
                 int dosig = getenv("GIST_FUSESIG") ? 1 : 0;   // fuse sigmoid into the FAST flat gate (σ(L) -> g_L)
                 if (getenv("GIST_EPIWG")) {
@@ -2387,7 +2368,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
                 } else {
                     static bool a1 = false;
                     if (!a1) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); a1 = true; }
-                    k_gate_hand_persist<<<pgrid, 384, hgsmem_p, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, dosig, 0);
+                    k_gate_hand_persist<<<pgrid, 384, hgsmem_p, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, dosig);
                 }
             } else {
                 // PHASE 2 (default): FUSED gate -> sigmoid (overlapped on the producer WG) + padded SL directly.

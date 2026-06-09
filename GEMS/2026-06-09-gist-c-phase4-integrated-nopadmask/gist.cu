@@ -785,7 +785,9 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                     int lc = 8 * gg + (lane % 4) * 2;
                     float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
                     if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp) {   // PADDED output to g_SL[B,Q,Fp]: write 0 (not σ(0)=0.5) for the g>=F pad cols
+                    if (padfp > 0) {   // PADDED output to g_SL[B,Q,Fp]: write 0 for g>=F pad cols.
+                        // (padfp<0 = NOPADMASK A/B: skip — SL[pad] is don't-care since the fused pool's N[g>=F]=0,
+                        //  so SL[pad]*N[pad]=0 regardless. Saves the per-col compare in the epilogue.)
                         int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;   // tile is within one q (Fp%256==0)
                         if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
                         if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
@@ -2369,7 +2371,8 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
                 static bool ap = false;
                 if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
                 int pgridp = pgrid;
-                k_gate_hand_persist<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, Fp);
+                int padarg = getenv("GIST_PADMASK") ? Fp : -Fp;   // DEFAULT skip pad-mask: SL[pad] don't-care (pool N[pad]=0); opt-in mask
+                k_gate_hand_persist<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, padarg);
             } else if (getenv("GIST_PHASE1RAW")) {
                 // PHASE 1 (raw logits, no fusion): persistent gate -> g_L, then k_sigpad applies sigmoid+pad.
                 int dosig = getenv("GIST_FUSESIG") ? 1 : 0;   // fuse sigmoid into the FAST flat gate (σ(L) -> g_L)

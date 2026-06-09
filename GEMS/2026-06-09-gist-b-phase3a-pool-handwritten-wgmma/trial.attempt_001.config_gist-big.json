@@ -1,0 +1,42 @@
+{
+  "config": {
+    "slug": "gist-big",
+    "params": {
+      "family": "gist",
+      "shape": [
+        1536,
+        128,
+        192
+      ],
+      "rank": 3,
+      "shape_kind": "3d",
+      "input_size": 37748736,
+      "input_shapes": [
+        [
+          1536,
+          1497,
+          192
+        ],
+        [
+          1497,
+          191616
+        ],
+        [
+          1497,
+          192
+        ]
+      ],
+      "harness_num_inputs": 3,
+      "harness_num_outputs": 1,
+      "harness_buf_size": 441483264,
+      "harness_output_size": 37748736,
+      "gist_b": 1536,
+      "gist_f": 1497,
+      "gist_d": 192,
+      "gist_q": 128,
+      "harness_scale_0": 3.464101615137755,
+      "harness_scale_1": 3.464101615137755,
+      "harness_scale_2": 0.08953229620716906
+    }
+  }
+}

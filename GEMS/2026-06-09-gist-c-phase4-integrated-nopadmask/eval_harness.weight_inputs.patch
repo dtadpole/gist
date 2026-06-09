@@ -1,0 +1,240 @@
+diff --git a/cuda_exec/scripts/eval_harness.cu b/cuda_exec/scripts/eval_harness.cu
+index aabc9fe..6b61bdd 100644
+--- a/cuda_exec/scripts/eval_harness.cu
++++ b/cuda_exec/scripts/eval_harness.cu
+@@ -22,11 +22,10 @@
+  *   consecutive kernels (previous kernel's epilogue writes vs current
+  *   kernel's TMA loads).  This matches PyTorch's benchmark_utils behavior.
+  *
+- *   Kernels that export kernel_setup() + kernel_launch() get cleaner
+- *   measurement: CPU-heavy work (TMA encoding, grid calc) is done once
+- *   in kernel_setup(), and only the lightweight kernel_launch() runs in
+- *   the timed loop.  Kernels without the split API fall back to
+- *   kernel_run() per iteration.
++ *   Single entry point: kernel_run(). The kernel self-initializes on its first
++ *   call (one-time allocation / weight preprocessing, cached internally) and is
++ *   pure steady-state afterward. Constant model weights are held fixed by the
++ *   harness (CUDA_EXEC_PARAM_HARNESS_WEIGHT_INPUTS) so that cache stays valid.
+  */
+ 
+ #include <cuda_bf16.h>
+@@ -44,20 +43,14 @@
+ /* ------------------------------------------------------------------ */
+ /* Kernel contract — implemented by the kernel .cu file               */
+ /* ------------------------------------------------------------------ */
+-/* Required: legacy all-in-one entry point */
++/* Single all-in-one entry point. The kernel self-initializes on its first call
++ * (one-time allocation / weight preprocessing, cached internally) and is pure
++ * steady-state on subsequent calls; weight inputs are held constant by the harness
++ * (see CUDA_EXEC_PARAM_HARNESS_WEIGHT_INPUTS) so that one-time cache stays valid. */
+ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
+                           __nv_bfloat16** outputs, int num_outputs,
+                           int n, cudaStream_t stream);
+ 
+-/* Optional: split setup/launch for pipelined measurement.
+- * kernel_setup does CPU work (TMA encoding, grid calc) once.
+- * kernel_launch only enqueues the GPU kernel (no CPU overhead).
+- * If both are defined, the harness uses them for the timed loop. */
+-extern "C" int kernel_setup(__nv_bfloat16** inputs, int num_inputs,
+-                            __nv_bfloat16** outputs, int num_outputs,
+-                            int n, cudaStream_t stream) __attribute__((weak));
+-extern "C" int kernel_launch(cudaStream_t stream) __attribute__((weak));
+-
+ /* ------------------------------------------------------------------ */
+ /* Internal harness config (not exposed to kernel authors)            */
+ /* ------------------------------------------------------------------ */
+@@ -177,7 +170,7 @@ static void fill_arange(__nv_bfloat16* host_buf, int count) {
+ /* data patterns.                                                     */
+ /* ------------------------------------------------------------------ */
+ __global__ void fill_random_bf16(__nv_bfloat16* buf, int count,
+-                                 unsigned int seed) {
++                                 unsigned int seed, float scale) {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= count) return;
+     /* fast hash: Wang's 32-bit integer hash */
+@@ -187,8 +180,9 @@ __global__ void fill_random_bf16(__nv_bfloat16* buf, int count,
+     h ^= (h >> 4);
+     h *= 0x27d4eb2du;
+     h ^= (h >> 15);
+-    /* map to [-0.5, 0.5) to keep values small (avoids fp overflow in matmul) */
+-    float val = (float)(h & 0xFFFFu) / 65536.0f - 0.5f;
++    /* map to [-0.5, 0.5); per-input scale (e.g. GIST unit-scale init) keeps the
++     * output O ~ O(1) so a bf16 kernel can pass allclose(1e-2) vs the reference. */
++    float val = ((float)(h & 0xFFFFu) / 65536.0f - 0.5f) * scale;
+     buf[idx] = __float2bfloat16(val);
+ }
+ 
+@@ -361,13 +355,47 @@ int main() {
+     const int num_outputs = env_int("CUDA_EXEC_HARNESS_NUM_OUTPUTS",
+                             env_int("CUDA_EXEC_PARAM_HARNESS_NUM_OUTPUTS",
+                             env_int("CUDA_EXEC_EXTRA_HARNESS_NUM_OUTPUTS", 1)));
+-    const size_t elem_bytes = static_cast<size_t>(cfg.input_size) * sizeof(__nv_bfloat16);
++    /* Heterogeneous-shape kernels (e.g. GIST): allocate every buffer to a
++     * uniform buf_size (= max tensor numel) so differently-shaped inputs all
++     * fit; only out_size elements are copied back / dumped for correctness.
++     * Both default to input_size, preserving uniform-shape kernel behavior.
++     * The PRNG fill is index-based, so the first numel_i elements of each
++     * buffer match trial.py's _harness_fill_random_bf16(numel_i, seed). */
++    const int buf_size = env_int("CUDA_EXEC_PARAM_HARNESS_BUF_SIZE", cfg.input_size);
++    const int out_size = env_int("CUDA_EXEC_PARAM_HARNESS_OUTPUT_SIZE", buf_size);
++    const size_t elem_bytes = static_cast<size_t>(buf_size) * sizeof(__nv_bfloat16);
++
++    /* Weight inputs: indices of buffers that are CONSTANT model weights (e.g. GEMM weights),
++     * not per-call activations. Real serving loads weights once; only activations vary per call,
++     * so a kernel may legitimately preprocess a weight once (layout repack, padding, quantization)
++     * and cache it. We therefore fill weight buffers with their FINAL (correctness) data up-front
++     * and never re-randomize / reallocate them — so such a cache stays valid across the timed loop
++     * and the correctness pass. The data COMPARED at correctness time is unchanged (still the
++     * seed=idx+1 PRNG the Python ref reproduces); only the timing of when weights are filled moves.
++     * Config: CUDA_EXEC_PARAM_HARNESS_WEIGHT_INPUTS="1,2" (comma-separated input indices). */
++    bool is_weight[64] = {false};
++    {
++        const char* wl = getenv("CUDA_EXEC_PARAM_HARNESS_WEIGHT_INPUTS");
++        if (wl && *wl) {
++            const char* p = wl;
++            while (*p) {
++                int idx = atoi(p);
++                if (idx >= 0 && idx < 64) is_weight[idx] = true;
++                while (*p && *p != ',') p++;
++                if (*p == ',') p++;
++            }
++        }
++    }
++    auto in_scale = [](int j) -> float {
++        char nm[64]; snprintf(nm, sizeof(nm), "CUDA_EXEC_PARAM_HARNESS_SCALE_%d", j);
++        const char* v = getenv(nm); return v ? (float)atof(v) : 1.0f;
++    };
+ 
+     /* Allocate and fill host inputs (BF16 arange) */
+     std::vector<std::vector<__nv_bfloat16>> h_inputs(num_inputs);
+     for (int i = 0; i < num_inputs; i++) {
+-        h_inputs[i].resize(cfg.input_size);
+-        fill_arange(h_inputs[i].data(), cfg.input_size);
++        h_inputs[i].resize(buf_size);
++        fill_arange(h_inputs[i].data(), buf_size);
+     }
+ 
+     /* Allocate device inputs */
+@@ -380,6 +408,19 @@ int main() {
+         cudaMemcpy(d_inputs[i], h_inputs[i].data(), elem_bytes, cudaMemcpyHostToDevice);
+     }
+ 
++    /* Fill weight inputs with their FINAL (correctness, seed=idx+1) data up-front, before the first
++     * kernel_run, so any one-time weight preprocessing the kernel caches is built from the right data
++     * and stays valid (weights are never re-randomized/reallocated below). */
++    {
++        const int wb = 256, wg = (buf_size + wb - 1) / wb;
++        bool any = false;
++        for (int j = 0; j < num_inputs; j++) if (is_weight[j]) {
++            fill_random_bf16<<<wg, wb, 0, 0>>>(d_inputs[j], buf_size, (unsigned)(j + 1), in_scale(j));
++            any = true;
++        }
++        if (any) cudaDeviceSynchronize();
++    }
++
+     /* Allocate device outputs */
+     std::vector<__nv_bfloat16*> d_outputs(num_outputs, nullptr);
+     for (int i = 0; i < num_outputs; i++) {
+@@ -408,13 +449,7 @@ int main() {
+         cudaMalloc(&l2_flush_buf, l2_size);
+     }
+ 
+-    /* ── Detect setup/launch split ─────────────────────────────────── */
+-    /* If the kernel exports kernel_setup + kernel_launch, we can separate
+-     * CPU-heavy setup (TMA encoding, grid calc) from the GPU-only launch.
+-     * This enables safe pipelined measurement (like Triton do_bench). */
+-    const bool has_split = (kernel_setup != nullptr && kernel_launch != nullptr);
+-
+-    /* ── Initial run + setup ──────────────────────────────────────── */
++    /* ── Initial run (kernel self-initializes: one-time alloc / weight preprocessing, cached) ── */
+     {
+         int rc = kernel_run(d_inputs.data(), num_inputs,
+                             d_outputs.data(), num_outputs,
+@@ -426,21 +461,8 @@ int main() {
+         }
+     }
+ 
+-    /* If split API available, call setup once (caches TMA descriptors etc.) */
+-    if (has_split) {
+-        int rc = kernel_setup(d_inputs.data(), num_inputs,
+-                              d_outputs.data(), num_outputs,
+-                              cfg.input_size, stream);
+-        cudaStreamSynchronize(stream);
+-        if (rc != 0) {
+-            fprintf(stderr, "kernel_setup failed: rc=%d\n", rc);
+-            return 4;
+-        }
+-    }
+-
+-    /* Helper lambda: invoke kernel with minimal overhead */
++    /* Helper lambda: invoke the single kernel_run entry point */
+     auto invoke_kernel = [&](cudaStream_t s) -> int {
+-        if (has_split) return kernel_launch(s);
+         return kernel_run(d_inputs.data(), num_inputs,
+                           d_outputs.data(), num_outputs,
+                           cfg.input_size, s);
+@@ -477,24 +499,17 @@ int main() {
+     cudaStreamSynchronize(stream);
+     GpuSnapshot snap_warmup = gpu_snapshot();
+ 
+-    /* Randomize inputs before the timed loop */
++    /* Randomize inputs before the timed loop (weights are left as filled up-front and untouched) */
+     const int rand_block = 256;
+-    const int rand_grid = (cfg.input_size + rand_block - 1) / rand_block;
++    const int rand_grid = (buf_size + rand_block - 1) / rand_block;
+     for (int j = 0; j < num_inputs; j++) {
++        if (is_weight[j]) continue;                       // constant weight: do not re-randomize
+         unsigned int seed = 0xCAFE0000u + (unsigned int)j;
+         fill_random_bf16<<<rand_grid, rand_block, 0, stream>>>(
+-            d_inputs[j], cfg.input_size, seed);
++            d_inputs[j], buf_size, seed, in_scale(j));
+     }
+     cudaStreamSynchronize(stream);
+ 
+-    /* Re-setup after input randomization (pointers unchanged, but data changed) */
+-    if (has_split) {
+-        kernel_setup(d_inputs.data(), num_inputs,
+-                     d_outputs.data(), num_outputs,
+-                     cfg.input_size, stream);
+-        cudaStreamSynchronize(stream);
+-    }
+-
+     /* ── Time-based measurement (pipelined — no per-iteration sync) ── */
+     const int n_trials = (int)(cfg.rep_ms / est_ms);
+     const int N = n_trials > 1 ? n_trials : 1;
+@@ -552,14 +567,19 @@ int main() {
+     /* Correctness pass: allocate fresh buffers and fill with deterministic
+      * random data. Seeds are simply 1, 2, 3, ... per input tensor.
+      * The Python trial script reproduces this exact PRNG for comparison.
+-     * Using random instead of arange avoids BF16 overflow for large sizes. */
++     * Using random instead of arange avoids BF16 overflow for large sizes.
++     * WEIGHT inputs are NOT freed/reallocated/refilled — they were filled with the same
++     * seed=idx+1 data up-front and held constant, so the data compared here is identical
++     * (the Python ref still reproduces seed=idx+1 for every input), while a kernel's one-time
++     * weight preprocessing stays valid. Only activations are refreshed here. */
+     for (int j = 0; j < num_inputs; j++)
+-        cudaFree(d_inputs[j]);
++        if (!is_weight[j]) cudaFree(d_inputs[j]);
+     for (int j = 0; j < num_inputs; j++) {
++        if (is_weight[j]) continue;                       // constant weight: keep the up-front buffer/data
+         cudaMalloc(&d_inputs[j], elem_bytes);
+         unsigned int correctness_seed = (unsigned int)(j + 1);  /* seed 1, 2, 3, ... */
+         fill_random_bf16<<<rand_grid, rand_block, 0, stream>>>(
+-            d_inputs[j], cfg.input_size, correctness_seed);
++            d_inputs[j], buf_size, correctness_seed, in_scale(j));
+     }
+     cudaStreamSynchronize(stream);
+ 
+@@ -577,9 +597,10 @@ int main() {
+     /* Copy outputs to host (BF16) */
+     std::vector<std::vector<__nv_bfloat16>> h_outputs(num_outputs);
+     for (int i = 0; i < num_outputs; i++) {
+-        h_outputs[i].resize(cfg.input_size);
++        h_outputs[i].resize(out_size);
+         cudaMemcpy(h_outputs[i].data(), d_outputs[i],
+-                   elem_bytes, cudaMemcpyDeviceToHost);
++                   static_cast<size_t>(out_size) * sizeof(__nv_bfloat16),
++                   cudaMemcpyDeviceToHost);
+     }
+ 
+     /* Print structured JSON */

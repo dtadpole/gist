@@ -216,22 +216,6 @@ __device__ __forceinline__ void wgmma_commit_wait32(float* d) {
 namespace cute_gmma = cute::SM90::GMMA;
 using GistGmmaAtom = cute::SM90::GMMA::MMA_64x64x16_F32BF16BF16_SS<
     cute_gmma::Major::K, cute_gmma::Major::MN, cute_gmma::ScaleIn::One, cute_gmma::ScaleIn::One>;
-// POOL atom: m64n192k16, A K-major (trans-a=0), B MN-major (trans-b=1), fp32 acc[96]. Validated in
-// /tmp/pooltest192.cu (max_err 0). The K-major A smem tile is the canonical Layout_K_SW128_Atom
-// ([64x64] contiguous bf16); A desc = wg_desc_sw3(&As[ks*16], LBO=16, SBO=1024) (per-k16 +16 bf16,
-// since K is contiguous in K-major). B (3 contiguous 64-bricks) = wg_desc_sw3(&Bs[ks*1024], 8192, 1024).
-using GistPoolAtom = cute::SM90::GMMA::MMA_64x192x16_F32BF16BF16_SS<
-    cute_gmma::Major::K, cute_gmma::Major::MN, cute_gmma::ScaleIn::One, cute_gmma::ScaleIn::One>;
-__device__ __forceinline__ void wgmma_cute_m64n192k16(float* d, uint64_t da, uint64_t db) {
-    GistPoolAtom::fma(da, db,
-        d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15],
-        d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31],
-        d[32],d[33],d[34],d[35],d[36],d[37],d[38],d[39],d[40],d[41],d[42],d[43],d[44],d[45],d[46],d[47],
-        d[48],d[49],d[50],d[51],d[52],d[53],d[54],d[55],d[56],d[57],d[58],d[59],d[60],d[61],d[62],d[63],
-        d[64],d[65],d[66],d[67],d[68],d[69],d[70],d[71],d[72],d[73],d[74],d[75],d[76],d[77],d[78],d[79],
-        d[80],d[81],d[82],d[83],d[84],d[85],d[86],d[87],d[88],d[89],d[90],d[91],d[92],d[93],d[94],d[95],
-        cute_gmma::ScaleOut::One);
-}
 __device__ __forceinline__ void wgmma_cute_fence32(float* d) {
     #pragma unroll
     for (int i = 0; i < 32; i++) cute::warpgroup_fence_operand(d[i]);
@@ -360,54 +344,41 @@ __device__ __forceinline__ void wgmma_m64n256k16_AN(float* d, uint64_t da, uint6
 // (bf16, the pool's WGMMA B-operand; pad rows f in [F,Fp) -> 0). NITER=ceil((D/2)/32)=3 for D=192.
 constexpr int RPW = 1, NITER = 3;
 
-// stats-only (M,R=rrms; no N). VECTORIZED: int4 (16B) X loads + an SG-lane sub-group reduction over D (each
-// warp does 32/SG rows). The old RPW=1/4-byte-load version was SM-issue-bound (NCU: sm 85.6%, DRAM 54% — too
-// many small loads); int4 + SG=8 makes it BW-bound at ~92% of this GPU's real ~2.3 TB/s read ceiling (~0.42ms).
-// (Ported from GEMS/2026-06-08-stats-mr-vec128; final math swapped LayerNorm rstd -> RMSNorm rrms.)
-#ifndef STATS_SG
-#define STATS_SG 8
-#endif
-constexpr int STATS_WPB = 8;                         // warps/block for k_stats_mr (block = 256 threads)
-template <int SG>
-__device__ __forceinline__ void stats_mr_body(const __nv_bfloat16* __restrict__ X,
-                             __nv_bfloat16* __restrict__ M, float* __restrict__ R,
-                             int B, int F, int Fp, int D, float eps) {
-    constexpr int ROWS_PER_WARP = 32 / SG;
-    const int tid = threadIdx.x, lane = tid & 31;
-    const int warpInBlk = tid >> 5, warpsPerBlk = blockDim.x >> 5;
-    const int sub = lane / SG, sl = lane % SG;       // row within warp / lane within sub-group
-    const long warpId = (long)blockIdx.x * warpsPerBlk + warpInBlk;
-    const long prow = warpId * ROWS_PER_WARP + sub;
-    const long total = (long)B * Fp;
-    const int D8 = D >> 3;                            // # int4 (8 bf16) along D
-    const unsigned sgmask = ((SG == 32) ? 0xffffffffu : ((1u << SG) - 1u)) << (sub * SG);
-    bool ok = (prow < total);
-    int b = ok ? (int)(prow / Fp) : 0, f = ok ? (int)(prow % Fp) : 0;
-    bool valid = ok && (f < F);
-    float s = 0.f, s2 = 0.f;
-    if (valid) {
-        const int4* x4 = reinterpret_cast<const int4*>(X + ((long)b * F + f) * D);
-        #pragma unroll
-        for (int i = sl; i < D8; i += SG) {
-            int4 raw = x4[i];
-            const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-            #pragma unroll
-            for (int k = 0; k < 4; k++) { float a = b2f(v2[k].x), c = b2f(v2[k].y); s += a + c; s2 += a * a + c * c; }
-        }
-    }
-    #pragma unroll
-    for (int o = SG >> 1; o > 0; o >>= 1) { s += __shfl_down_sync(sgmask, s, o, SG); s2 += __shfl_down_sync(sgmask, s2, o, SG); }
-    if (valid && sl == 0) {
-        float m = s / D;                             // mean (gate input)
-        float rrms = rsqrtf(s2 / D + eps);           // RMSNorm: rsqrt(mean(X^2)+eps), no centering
-        M[(long)f * B + b] = __float2bfloat16(m);
-        R[(long)b * F + f] = rrms;
-    }
-}
+// stats-only variant: writes ONLY M[b,f] and R[b,f], skips N_pad (for fused pool path).
 __global__ void k_stats_mr(const __nv_bfloat16* __restrict__ X,
                            __nv_bfloat16* __restrict__ M, float* __restrict__ R,
                            int B, int F, int Fp, int D, float eps) {
-    stats_mr_body<STATS_SG>(X, M, R, B, F, Fp, D, eps);
+    int lane = threadIdx.x & 31;
+    long warpId = (long)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    long total = (long)B * Fp, base = warpId * RPW;
+    int D2 = D >> 1;
+    const __nv_bfloat162* X2base = reinterpret_cast<const __nv_bfloat162*>(X);
+    __nv_bfloat162 xv[RPW][NITER];
+    float s[RPW], s2[RPW]; int bb[RPW], ff[RPW]; bool ok[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) { s[r] = 0.f; s2[r] = 0.f; long prow = base + r;
+        ok[r] = prow < total; bb[r] = ok[r] ? prow / Fp : 0; ff[r] = ok[r] ? prow % Fp : 0; }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) if (ok[r] && ff[r] < F) {
+        const __nv_bfloat162* x2 = X2base + ((long)bb[r] * F + ff[r]) * D2;
+        #pragma unroll
+        for (int i = 0; i < NITER; i++) { int d2 = lane + i * 32;
+            if (d2 < D2) { __nv_bfloat162 v = x2[d2]; xv[r][i] = v;
+                float a = b2f(v.x), c = b2f(v.y); s[r] += a + c; s2[r] += a * a + c * c; } }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) { s[r] += __shfl_down_sync(0xffffffff, s[r], o); s2[r] += __shfl_down_sync(0xffffffff, s2[r], o); }
+        s[r] = __shfl_sync(0xffffffff, s[r], 0); s2[r] = __shfl_sync(0xffffffff, s2[r], 0);
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        if (!ok[r] || ff[r] >= F) continue;
+        float m = s[r] / D;                          // gate input (mean over D) — unchanged
+        float rrms = rsqrtf(s2[r] / D + eps);        // RMSNorm: rsqrt(mean(X^2)+eps), no -m*m centering
+        if (lane == 0) { M[(long)ff[r] * B + bb[r]] = __float2bfloat16(m); R[(long)bb[r] * F + ff[r]] = rrms; }
+    }
 }
 // N-only LayerNorm: reads X + M (col-major bf16) + R + gamma/beta -> Npad[B,Fp,D]. Runs CONCURRENTLY
 // with the gate on a 2nd stream (the gate needs only M, and is at 19% DRAM -> N's traffic hides in the
@@ -697,7 +668,7 @@ constexpr int HGP_S = 4, HGP_NCH = 4, HGP_CW = HG_BN / HGP_NCH;
 __global__ __launch_bounds__(384, 1)
 void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                          const __grid_constant__ CUtensorMap tmLc,
-                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp) {
+                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig) {
     const int TILE = 64 * 64;
     const int nM = B / HG_BM;
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
@@ -785,11 +756,6 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                     int lc = 8 * gg + (lane % 4) * 2;
                     float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
                     if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp) {   // PADDED output to g_SL[B,Q,Fp]: write 0 (not σ(0)=0.5) for the g>=F pad cols
-                        int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;   // tile is within one q (Fp%256==0)
-                        if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
-                        if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
-                    }
                     *(__nv_bfloat162*)&ch[r0 * HGP_CW + lc] = __floats2bfloat162_rn(a0, a1);
                     *(__nv_bfloat162*)&ch[r1 * HGP_CW + lc] = __floats2bfloat162_rn(b0, b1);
                 }
@@ -1220,332 +1186,6 @@ static int run_pool(const __nv_bfloat16* SL, const __nv_bfloat16* Npad, __nv_bfl
     if (need) cudaMemsetAsync(g_ws2, 0, need, stream);
     if (gemm.initialize(args, g_ws2, stream) != cutlass::Status::kSuccess) return 31;
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 32;
-    return 0;
-}
-
-// ===== PHASE 3a: HAND-WRITTEN persistent warp-spec WGMMA pool (replaces CUTLASS run_pool) =====
-// O[b] = SL[b] @ N[b], per batch [M=Q=128, N=D=192, K=Fp=1536], batch=B=1536. One batch = one
-// output tile [128x192]. Mirrors k_gate_hand_persist: 132 persistent CTAs grid-stride over batches,
-// 3 WG (producer tid>=256 issues TMA; 2 consumers each own 64 Q-rows), S-stage ring, continuous gk.
-//   A = SL [B,Q,Fp] row-major -> K-major operand (Fp contiguous). TMA globalDim {Fp, B*Q}, box 64x64
-//       SW128; load 2 M-halves at (k0, b*Q + ms*64). desc = wg_desc_sw3(&As[ks*16], 16, 1024).
-//   B = N  [B,Fp,D] row-major -> MN-major operand (D contiguous). TMA globalDim {D, B*Fp}, box 64x64
-//       SW128; load 3 D-bricks at (n2*64, b*Fp + k0). desc = wg_desc_sw3(&Bs[ks*1024], 8192, 1024).
-//   wgmma.m64n192k16 (acc[96]/thread) x ntK=24 k-blocks. Epilogue: stage acc -> smem [128x192],
-//   TMA-store O tile (box {192,128}, no swizzle). Validated K-major recipe: /tmp/pooltest192.cu max_err 0.
-constexpr int HP_BM = 128, HP_BN = 192, HP_BK = 64, HP_MSUB = 2, HP_NSUB = 3, HP_S = 4;
-__global__ __launch_bounds__(384, 1)
-void k_pool_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-                         const __grid_constant__ CUtensorMap tmO,
-                         __nv_bfloat16* __restrict__ O, int B, int Q, int D, int Fp) {
-    const int TILE = HP_BK * HP_BK;                  // 64x64 brick
-    const int ntiles = B;                            // one tile per batch
-    const int ntK = Fp / HP_BK;                      // 24 k-blocks
-    extern __shared__ __align__(128) char psm[];
-    __nv_bfloat16* As = (__nv_bfloat16*)psm;                 // [HP_S][HP_MSUB][TILE]
-    __nv_bfloat16* Bs = As + HP_S * HP_MSUB * TILE;         // [HP_S][HP_NSUB][TILE]
-    uint64_t* full = (uint64_t*)(Bs + HP_S * HP_NSUB * TILE);// [HP_S]
-    uint64_t* empt = full + HP_S;                            // [HP_S]
-    __nv_bfloat16* ostg = (__nv_bfloat16*)(((uintptr_t)(empt + HP_S) + 127) & ~(uintptr_t)127); // [HP_BM][HP_BN]
-    const int Asb = HP_MSUB * TILE, Bsb = HP_NSUB * TILE;
-    const unsigned txBytes = (unsigned)((HP_MSUB + HP_NSUB) * TILE * 2);
-    int tid = threadIdx.x;
-    if (tid == 0) {
-        #pragma unroll
-        for (int s = 0; s < HP_S; s++) { mbar_init(&full[s], 1); mbar_init(&empt[s], 256); }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
-    __syncthreads();
-
-    if (tid >= 256) {
-        // ===== PRODUCER: tid256 streams A+B into the S-stage ring, continuous gk across batches =====
-        if (tid == 256) {
-            long gk = 0;
-            int pe[HP_S];
-            #pragma unroll
-            for (int s = 0; s < HP_S; s++) pe[s] = 0;
-            for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-                int b = ti;
-                int mrow = b * Q;            // flat M-row base for A (SL [B*Q, Fp])
-                long brow = (long)b * Fp;    // flat row base for B (N [B*Fp, D])
-                for (int kt = 0; kt < ntK; kt++) {
-                    int buf = (int)(gk % HP_S), k0 = kt * HP_BK;
-                    if (gk >= HP_S) { mbar_wait(&empt[buf], pe[buf]); pe[buf] ^= 1; }
-                    mbar_expect_tx(&full[buf], txBytes);
-                    #pragma unroll
-                    for (int ms = 0; ms < HP_MSUB; ms++)
-                        tma_load_2d(&As[buf * Asb + ms * TILE], &tmA, k0, mrow + ms * HP_BK, &full[buf]);
-                    #pragma unroll
-                    for (int n2 = 0; n2 < HP_NSUB; n2++)
-                        tma_load_2d(&Bs[buf * Bsb + n2 * TILE], &tmB, n2 * HP_BK, (int)(brow + k0), &full[buf]);
-                    gk++;
-                }
-            }
-        }
-    } else {
-        // ===== CONSUMER: each wg owns 64 Q-rows; acc[96] (m64n192) per batch tile =====
-        int wg = tid >> 7, warp = (tid >> 5) & 3, lane = tid & 31;
-        long gk = 0;
-        int pf[HP_S];
-        #pragma unroll
-        for (int s = 0; s < HP_S; s++) pf[s] = 0;
-        for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-            int b = ti;
-            float acc[96];
-            #pragma unroll
-            for (int i = 0; i < 96; i++) acc[i] = 0.f;
-            for (int kt = 0; kt < ntK; kt++) {
-                int buf = (int)(gk % HP_S);
-                mbar_wait(&full[buf], pf[buf]); pf[buf] ^= 1;
-                wgmma_fenceN(acc, 96);
-                cute::warpgroup_arrive();
-                #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
-                    uint64_t da = wg_desc_sw3(&As[buf * Asb + wg * TILE + ks * 16], 16, 1024);
-                    uint64_t db = wg_desc_sw3(&Bs[buf * Bsb + ks * 1024], 8192, 1024);
-                    wgmma_cute_m64n192k16(acc, da, db);
-                }
-                cute::warpgroup_commit_batch();
-                cute::warpgroup_wait<0>();
-                wgmma_fenceN(acc, 96);
-                mbar_arrive(&empt[buf]);
-                gk++;
-            }
-            // ===== epilogue: stage acc -> ostg [HP_BM][HP_BN], one TMA store of the [128x192] O tile =====
-            bar_sync_consumers();                            // all consumers done reading As/Bs ring
-            #pragma unroll
-            for (int g = 0; g < 24; g++) {
-                int r0 = wg * 64 + 16 * warp + lane / 4, r1 = r0 + 8;
-                int c0 = 8 * g + (lane % 4) * 2;
-                *(__nv_bfloat162*)&ostg[r0 * HP_BN + c0] = __floats2bfloat162_rn(acc[4*g+0], acc[4*g+1]);
-                *(__nv_bfloat162*)&ostg[r1 * HP_BN + c0] = __floats2bfloat162_rn(acc[4*g+2], acc[4*g+3]);
-            }
-            bar_sync_consumers();                            // staging complete
-            if (tid == 0) {
-                wgmma_async_proxy_fence();                   // generic stores -> async-proxy store visible
-                tma_store_2d(&tmO, ostg, 0, b * Q);          // O tile [128x192] at (col=0, row=b*Q); box {192,128}
-                tma_store_commit();
-                tma_store_wait<0>();                         // landed before ostg reused next tile
-            }
-        }
-    }
-    (void)D;
-}
-
-// ===== PHASE 3b: FUSED pool — computes N = X*rrms*W INLINE (no materialized g_N). stats writes only M,R. =====
-// Same persistent warp-spec WGMMA pool as k_pool_hand_persist, but the B-operand is built on the fly:
-//   producer TMA-loads A=SL (2 bricks) + X (3 bricks, 3D TMA over [D,F,B], OOB-fill 0 for f>=F) + W (3 bricks)
-//   consumers load rrms[b,k0:k0+64], compute N[g,d]=X[g,d]*rrms[g]*W[g,d] IN-PLACE over the X brick (rrms[g]
-//   per-K-row via gh_sw_off(k,mn)), then wgmma. Mirrors Triton _pool_kernel (N=x*rg[:,None]*w, on the fly).
-// Memory win: replaces the 0.906GB g_N read with a 0.441GB X read (+ W L2-cached) AND deletes the N write in stats.
-constexpr int HPF_S = 3;   // fused ring depth (8 bricks/stage As2+Xs3+Ws3 -> S=3=192KB + chunked O-store fits 227KB)
-__global__ __launch_bounds__(384, 1)
-void k_pool_hand_fused(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmX,
-                       const __grid_constant__ CUtensorMap tmW, const __grid_constant__ CUtensorMap tmO,
-                       __nv_bfloat16* __restrict__ O, const float* __restrict__ R,
-                       int B, int Q, int D, int F, int Fp) {
-    const int TILE = HP_BK * HP_BK;                  // 64x64 brick
-    const int ntiles = B;
-    const int ntK = Fp / HP_BK;                      // 24 k-blocks
-    extern __shared__ __align__(128) char psm[];
-    __nv_bfloat16* As = (__nv_bfloat16*)psm;                  // [HPF_S][HP_MSUB][TILE]  (SL, K-major)
-    __nv_bfloat16* Xs = As + HPF_S * HP_MSUB * TILE;         // [HPF_S][HP_NSUB][TILE]  (X -> N in place)
-    __nv_bfloat16* Ws = Xs + HPF_S * HP_NSUB * TILE;         // [HPF_S][HP_NSUB][TILE]  (W, TMA-staged)
-    uint64_t* full = (uint64_t*)(Ws + HPF_S * HP_NSUB * TILE);// [HPF_S]
-    uint64_t* empt = full + HPF_S;                            // [HPF_S]
-    float* rsm = (float*)(empt + HPF_S);                     // [64] rrms for the current k-block
-    __nv_bfloat16* ostg = (__nv_bfloat16*)(((uintptr_t)(rsm + 64) + 127) & ~(uintptr_t)127); // [2][HP_BM][64] chunked
-    const int Asb = HP_MSUB * TILE, Xsb = HP_NSUB * TILE, Wsb = HP_NSUB * TILE;
-    const unsigned txBytes = (unsigned)((HP_MSUB + 2 * HP_NSUB) * TILE * 2);   // SL2 + X3 + W3 bricks
-    int tid = threadIdx.x;
-    if (tid == 0) {
-        #pragma unroll
-        for (int s = 0; s < HPF_S; s++) { mbar_init(&full[s], 1); mbar_init(&empt[s], 256); }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
-    __syncthreads();
-
-    if (tid >= 256) {
-        // PRODUCER: stream A=SL + X + W into the ring (continuous gk across batches).
-        if (tid == 256) {
-            long gk = 0;
-            int pe[HPF_S];
-            #pragma unroll
-            for (int s = 0; s < HPF_S; s++) pe[s] = 0;
-            for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-                int b = ti, mrow = b * Q;
-                for (int kt = 0; kt < ntK; kt++) {
-                    int buf = (int)(gk % HPF_S), k0 = kt * HP_BK;
-                    if (gk >= HPF_S) { mbar_wait(&empt[buf], pe[buf]); pe[buf] ^= 1; }
-                    mbar_expect_tx(&full[buf], txBytes);
-                    #pragma unroll
-                    for (int ms = 0; ms < HP_MSUB; ms++)
-                        tma_load_2d(&As[buf * Asb + ms * TILE], &tmA, k0, mrow + ms * HP_BK, &full[buf]);
-                    #pragma unroll
-                    for (int n2 = 0; n2 < HP_NSUB; n2++)
-                        tma_load_3d(&Xs[buf * Xsb + n2 * TILE], &tmX, n2 * HP_BK, k0, b, &full[buf]);  // X[D,F,B] OOB-fill 0
-                    #pragma unroll
-                    for (int n2 = 0; n2 < HP_NSUB; n2++)
-                        tma_load_2d(&Ws[buf * Wsb + n2 * TILE], &tmW, n2 * HP_BK, k0, &full[buf]);     // W[D,F] OOB-fill 0
-                    gk++;
-                }
-            }
-        }
-    } else {
-        int wg = tid >> 7, warp = (tid >> 5) & 3, lane = tid & 31;
-        long gk = 0;
-        int pf[HPF_S];
-        #pragma unroll
-        for (int s = 0; s < HPF_S; s++) pf[s] = 0;
-        for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-            int b = ti;
-            float acc[96];
-            #pragma unroll
-            for (int i = 0; i < 96; i++) acc[i] = 0.f;
-            // PIPELINE: compute N one k-block AHEAD so the N-compute (CUDA cores) overlaps the wgmma (tensor).
-            // Prologue computes N(kt=0); the loop issues wgmma(kt) [async] then computes N(kt+1) while it runs.
-            #define POOL_COMPUTE_N(BUF, K0) do {                                                              \
-                mbar_wait(&full[(BUF)], pf[(BUF)]); pf[(BUF)] ^= 1;                                            \
-                wgmma_async_proxy_fence();                       /* TMA X/W -> generic reads */               \
-                for (int k = tid; k < 64; k += 256) rsm[k] = ((K0) + k < F) ? R[(long)b * F + (K0) + k] : 0.f;\
-                bar_sync_consumers();                                                                          \
-                _Pragma("unroll") for (int C = tid; C < HP_NSUB * 512; C += 256) {  /* 512=64k*8chunks per brick */ \
-                    int brick = C / 512, rem = C - brick * 512, kk = rem >> 3, mn8 = rem & 7;                  \
-                    int so = brick * TILE + gh_sw_chunk(kk, mn8);  /* 16B chunk: 8 bf16, all share rsm[kk] */  \
-                    uint4 xv = *(uint4*)&Xs[(BUF) * Xsb + so]; uint4 wv = *(uint4*)&Ws[(BUF) * Wsb + so];       \
-                    float rr = rsm[kk];                                                                        \
-                    __nv_bfloat162* xp = (__nv_bfloat162*)&xv; __nv_bfloat162* wp = (__nv_bfloat162*)&wv;       \
-                    _Pragma("unroll") for (int j = 0; j < 4; j++) {                                            \
-                        float2 fx = __bfloat1622float2(xp[j]), fw = __bfloat1622float2(wp[j]);                 \
-                        xp[j] = __floats2bfloat162_rn(fx.x * rr * fw.x, fx.y * rr * fw.y);                     \
-                    }                                                                                          \
-                    *(uint4*)&Xs[(BUF) * Xsb + so] = xv;                                                       \
-                }                                                                                              \
-                bar_sync_consumers();                            /* N fully written */                        \
-                wgmma_async_proxy_fence();                       /* generic N -> wgmma async-proxy */          \
-            } while (0)
-            POOL_COMPUTE_N((int)(gk % HPF_S), 0);                // prologue: N(kt=0)
-            for (int kt = 0; kt < ntK; kt++) {
-                int buf = (int)(gk % HPF_S);
-                wgmma_fenceN(acc, 96);
-                cute::warpgroup_arrive();
-                #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
-                    uint64_t da = wg_desc_sw3(&As[buf * Asb + wg * TILE + ks * 16], 16, 1024);
-                    uint64_t db = wg_desc_sw3(&Xs[buf * Xsb + ks * 1024], 8192, 1024);
-                    wgmma_cute_m64n192k16(acc, da, db);
-                }
-                cute::warpgroup_commit_batch();
-                if (kt + 1 < ntK)                                // compute N(kt+1) overlapping the async wgmma(kt)
-                    POOL_COMPUTE_N((int)((gk + 1) % HPF_S), (kt + 1) * HP_BK);
-                cute::warpgroup_wait<0>();
-                wgmma_fenceN(acc, 96);
-                mbar_arrive(&empt[buf]);
-                gk++;
-            }
-            #undef POOL_COMPUTE_N
-            // chunked O store: 3 column-chunks of 64, double-buffered ostg[2][128][64] (fits S=3 smem).
-            #pragma unroll
-            for (int c = 0; c < 3; c++) {
-                int cb = c & 1;
-                __nv_bfloat16* ch = ostg + cb * (HP_BM * 64);
-                if (c >= 2 && tid == 0) tma_store_wait<1>();
-                bar_sync_consumers();
-                #pragma unroll
-                for (int gg = 0; gg < 8; gg++) {
-                    int g = c * 8 + gg;
-                    int r0 = wg * 64 + 16 * warp + lane / 4, r1 = r0 + 8;
-                    int c0 = 8 * gg + (lane % 4) * 2;
-                    *(__nv_bfloat162*)&ch[r0 * 64 + c0] = __floats2bfloat162_rn(acc[4*g+0], acc[4*g+1]);
-                    *(__nv_bfloat162*)&ch[r1 * 64 + c0] = __floats2bfloat162_rn(acc[4*g+2], acc[4*g+3]);
-                }
-                bar_sync_consumers();
-                if (tid == 0) {
-                    wgmma_async_proxy_fence();
-                    tma_store_2d(&tmO, ch, c * 64, b * Q);   // chunk c at (col c*64, row b*Q); box {64,128}
-                    tma_store_commit();
-                }
-            }
-            if (tid == 0) tma_store_wait<0>();
-        }
-    }
-    (void)D;
-}
-
-// Launcher for the hand pool: cached TMA maps on (SL,N,O) ptrs, smem attr once, persistent grid.
-static int launch_pool_hand(const __nv_bfloat16* SL, const __nv_bfloat16* N, __nv_bfloat16* O,
-                            int B, int Q, int D, int Fp, cudaStream_t stream) {
-    static CUtensorMap s_tmPA, s_tmPB, s_tmPO;
-    static const void* s_pSL = nullptr; static const void* s_pN = nullptr; static const void* s_pO = nullptr;
-    if (SL != s_pSL || N != s_pN || O != s_pO) {
-        // A = SL [B*Q, Fp] row-major (K-major operand): globalDim {Fp(fast), B*Q}, box {64,64}, SW128.
-        cuuint64_t gdA[2] = {(cuuint64_t)Fp, (cuuint64_t)B * Q}, gsA[1] = {(cuuint64_t)Fp * 2};
-        cuuint32_t bxA[2] = {64, 64}, es[2] = {1, 1};
-        cuTensorMapEncodeTiled(&s_tmPA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)SL, gdA, gsA, bxA, es,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        // B = N [B*Fp, D] row-major (MN-major operand): globalDim {D(fast), B*Fp}, box {64,64}, SW128.
-        cuuint64_t gdB[2] = {(cuuint64_t)D, (cuuint64_t)B * Fp}, gsB[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxB[2] = {64, 64};
-        cuTensorMapEncodeTiled(&s_tmPB, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)N, gdB, gsB, bxB, es,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        // O = [B*Q, D] row-major store: globalDim {D(fast), B*Q}, box {HP_BN=192, HP_BM=128}, no swizzle.
-        cuuint64_t gdO[2] = {(cuuint64_t)D, (cuuint64_t)B * Q}, gsO[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxO[2] = {HP_BN, HP_BM};
-        cuTensorMapEncodeTiled(&s_tmPO, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)O, gdO, gsO, bxO, es,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        s_pSL = SL; s_pN = N; s_pO = O;
-    }
-    const int TILE = HP_BK * HP_BK;
-    size_t mb = (size_t)(HP_S * (HP_MSUB + HP_NSUB)) * TILE * 2 + (size_t)(2 * HP_S) * 8;
-    mb = (mb + 127) & ~(size_t)127;
-    size_t smemB = mb + (size_t)HP_BM * HP_BN * 2;          // + full-tile O staging [128x192]
-    static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(k_pool_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemB); attr = true; }
-    int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
-    k_pool_hand_persist<<<numSM, 384, smemB, stream>>>(s_tmPA, s_tmPB, s_tmPO, O, B, Q, D, Fp);
-    return 0;
-}
-
-// Launcher for the FUSED hand pool (Phase 3b): N computed inline from X,rrms,W (no g_N). Maps: SL(K-major),
-// X(3D [D,F,B] OOB-0), W(2D [D,F]), O. rrms=R[B,F] passed as a pointer (not a map).
-static int launch_pool_hand_fused(const __nv_bfloat16* SL, const __nv_bfloat16* X, const __nv_bfloat16* W,
-                                  __nv_bfloat16* O, const float* R, int B, int Q, int D, int F, int Fp,
-                                  cudaStream_t stream) {
-    static CUtensorMap f_tmA, f_tmX, f_tmW, f_tmO;
-    static const void* f_pSL = nullptr; static const void* f_pX = nullptr; static const void* f_pW = nullptr; static const void* f_pO = nullptr;
-    if (SL != f_pSL || X != f_pX || W != f_pW || O != f_pO) {
-        cuuint32_t es2[2] = {1, 1}, es3[3] = {1, 1, 1};
-        // A = SL [B*Q, Fp] K-major: {Fp(fast), B*Q}, box {64,64}, SW128.
-        cuuint64_t gdA[2] = {(cuuint64_t)Fp, (cuuint64_t)B * Q}, gsA[1] = {(cuuint64_t)Fp * 2};
-        cuuint32_t bxA[2] = {64, 64};
-        cuTensorMapEncodeTiled(&f_tmA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)SL, gdA, gsA, bxA, es2,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        // X = [B,F,D] viewed 3D {D(fast), F, B}: strides dim1(F)=D*2, dim2(B)=F*D*2 (bytes). box {64,64,1} SW128, OOB-fill 0.
-        cuuint64_t gdX[3] = {(cuuint64_t)D, (cuuint64_t)F, (cuuint64_t)B};
-        cuuint64_t gsX[2] = {(cuuint64_t)D * 2, (cuuint64_t)F * D * 2};
-        cuuint32_t bxX[3] = {64, 64, 1};
-        cuTensorMapEncodeTiled(&f_tmX, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)X, gdX, gsX, bxX, es3,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        // W = [F,D] viewed {D(fast), F}, box {64,64}, SW128 (shared across batches; OOB-fill 0 for f>=F).
-        cuuint64_t gdW[2] = {(cuuint64_t)D, (cuuint64_t)F}, gsW[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxW[2] = {64, 64};
-        cuTensorMapEncodeTiled(&f_tmW, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)W, gdW, gsW, bxW, es2,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        // O = [B*Q, D] store, CHUNKED: {D(fast), B*Q}, box {64,128}, no swizzle (store 3 col-chunks of 64).
-        cuuint64_t gdO[2] = {(cuuint64_t)D, (cuuint64_t)B * Q}, gsO[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxO[2] = {64, HP_BM};
-        cuTensorMapEncodeTiled(&f_tmO, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)O, gdO, gsO, bxO, es2,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-        f_pSL = SL; f_pX = X; f_pW = W; f_pO = O;
-    }
-    const int TILE = HP_BK * HP_BK;
-    size_t mb = (size_t)(HPF_S * (HP_MSUB + 2 * HP_NSUB)) * TILE * 2 + (size_t)(2 * HPF_S) * 8 + 64 * 4;
-    mb = (mb + 127) & ~(size_t)127;
-    size_t smemB = mb + (size_t)2 * HP_BM * 64 * 2;        // + double-buffered chunked O staging [2][128][64]
-    static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(k_pool_hand_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemB); attr = true; }
-    int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
-    k_pool_hand_fused<<<numSM, 384, smemB, stream>>>(f_tmA, f_tmX, f_tmW, f_tmO, O, R, B, Q, D, F, Fp);
     return 0;
 }
 
@@ -2238,16 +1878,13 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     int warps_per_blk = 8;
     long stat_warps = ((long)B * Fp + RPW - 1) / RPW;
     long stat_blocks = (stat_warps + warps_per_blk - 1) / warps_per_blk;
-    // k_stats_mr (vectorized) grid: each warp does 32/STATS_SG rows; block = STATS_WPB warps.
-    long mr_warps = ((long)B * Fp + (32 / STATS_SG) - 1) / (32 / STATS_SG);
-    long mr_blocks = (mr_warps + STATS_WPB - 1) / STATS_WPB;
 
     // (PADP — gate writes SL_pad directly via column-padded P — was measured SLOWER: 4.27 (Fpad8) /
     //  4.36 (Fp); the P-pad copy + padded-P gate read cost more than the repad it removes. Removed.)
 
     // MPF path: WMMA fused pool, reads UNPADDED sigmoid'd g_L + computes N inline (stats writes M,R only)
     if (getenv("GIST_MPF")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
+        k_stats_mr<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
             int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);
             if (rc != 0) return rc;
@@ -2261,7 +1898,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
 
     // FUSED WGMMA pool path: stats writes ONLY M,R; pool computes N inline + reads sigmoid'd g_L
     if (getenv("GIST_WGMMA_FUSED")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
+        k_stats_mr<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
             int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);
             if (rc != 0) return rc;
@@ -2275,7 +1912,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
 
     // DIRECTION B: producer/consumer WARP-SPECIALIZED fused wgmma pool (k_pool_ws).
     if (getenv("GIST_WS")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
+        k_stats_mr<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
             // PROBE (GIST_CUBLAS_GATE): cuBLAS gate (no fused sigmoid — timing-only) vs CUTLASS gate, to
             // measure whether the gate (the lane-floor bottleneck, 2.42ms iso @14% warps) has a faster path.
@@ -2301,10 +1938,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     // HAND-WRITTEN GATE path (Phase 1): k_stats(M,R,N) -> k_gate_hand_b(raw L) -> k_sigpad(sigmoid+pad)
     // -> CUTLASS pool. Verifies the hand gate (raw logits) via the full O. Gate time via NCU / differential.
     if (getenv("GIST_HANDGATE")) {
-        if (getenv("GIST_POOLFUSE"))   // Phase 3b: stats writes only M,R (no N); the fused pool computes N inline
-            k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
-        else
-            k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
+        k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
             size_t hgsmem = (size_t)(HG_S * HG_MSUB * 64 * 64 + HG_S * HG_NSUB * 64 * 64) * sizeof(__nv_bfloat16)
                           + (size_t)(2 * HG_S) * sizeof(uint64_t);
@@ -2356,21 +1990,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
             int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
             int pgrid = numSM;
             if (getenv("GIST_HGGRID")) pgrid = atoi(getenv("GIST_HGGRID"));
-            if (getenv("GIST_GATEPAD")) {
-                // PHASE 4: padded gate. M @ Pp (Pp = per-q-padded P[F,Q*Fp]) -> writes g_SL[B,Q,Fp] DIRECTLY
-                // (σ fused via tanh; pad cols g>=F masked to 0). No repad kernel. ~3% extra compute (N: QF->Q*Fp),
-                // NO remap (Fp=1536 multiple of the 64-col chunk => aligned store). k_ppad once (P is constant).
-                int dosig = getenv("GIST_FUSESIG") ? 1 : 0;
-                static const void* s_ppsrc = nullptr;
-                if (P != s_ppsrc) {                          // one-time weight prepack (harness holds P constant)
-                    k_ppad<<<(unsigned)((long)F * Q), 256, 0, stream>>>(P, g_Ppad, F, Q, QF, (long)Q * Fp, Fp);
-                    s_ppsrc = P;
-                }
-                static bool ap = false;
-                if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
-                int pgridp = pgrid;
-                k_gate_hand_persist<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, Fp);
-            } else if (getenv("GIST_PHASE1RAW")) {
+            if (getenv("GIST_PHASE1RAW")) {
                 // PHASE 1 (raw logits, no fusion): persistent gate -> g_L, then k_sigpad applies sigmoid+pad.
                 int dosig = getenv("GIST_FUSESIG") ? 1 : 0;   // fuse sigmoid into the FAST flat gate (σ(L) -> g_L)
                 if (getenv("GIST_EPIWG")) {
@@ -2387,7 +2007,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
                 } else {
                     static bool a1 = false;
                     if (!a1) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); a1 = true; }
-                    k_gate_hand_persist<<<pgrid, 384, hgsmem_p, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, dosig, 0);
+                    k_gate_hand_persist<<<pgrid, 384, hgsmem_p, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, dosig);
                 }
             } else {
                 // PHASE 2 (default): FUSED gate -> sigmoid (overlapped on the producer WG) + padded SL directly.
@@ -2439,8 +2059,6 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         }
         if (getenv("GIST_SKIP_POOL")) return 0;
         // Phase 2: g_SL is already sigmoid'd + padded by the fused gate (no sigpad/repad).
-        if (getenv("GIST_POOLFUSE")) { int rc = launch_pool_hand_fused(g_SL, X, GAMMA, O, g_R, B, Q, D, F, Fp, stream); if (rc) return rc; return 0; }
-        if (getenv("GIST_POOLHAND")) { int rc = launch_pool_hand(g_SL, g_N, O, B, Q, D, Fp, stream); if (rc) return rc; return 0; }
         return run_pool(g_SL, g_N, O, B, Q, D, Fp, stream);
     }
 
