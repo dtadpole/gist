@@ -9,15 +9,16 @@ FORMAT:
   - IMPLICATION: what other branches should do/avoid
 
 **Measured — ONE method (`triton.testing.do_bench`: warmup + L2-flush + median, design shape, RMSNorm/F=1497, bf16, one session):**
-- **Triton-fast 4.22 ms · CUDA `cuda/gist.cu` 3.62 ms → ~14% faster.** (Context: eager 12.5, torch.compile 4.30.)
-- The cuda_exec harness reports the CUDA kernel at ~3.49 ms — a DIFFERENT timer; for the Triton comparison use the
+- **Triton-fast 4.20 ms · CUDA `cuda/gist.cu` 3.51 ms → ~16% faster.** (Context: eager 12.5, torch.compile 4.29.)
+- The cuda_exec harness reports the CUDA kernel at ~3.40 ms — a DIFFERENT timer; for the Triton comparison use the
   do_bench PAIR above so both are measured the same way. DON'T mix methods (that mixing was the 4.15/4.31/4.41 mess).
 
-Targets vs the 4.22 bar: **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
+Targets (user-defined, vs ~4.2 Triton): **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
 
-**Current best (RMSNorm/F=1497): 3.62 ms = ~14% faster than Triton (do_bench).** Migrated from the 3.465 LayerNorm
-gem (gate-NOSIG + vectorized sigpad); same latency (RMSNorm = same memory footprint, only drops −m·m + uses W[f,d]).
-Still SHORT of the 20% bar (3.38). Per-stage (≈ms, structure unchanged): stats(M,R,N)≈0.86 · gate≈1.25 · sigpad≈0.56 · pool≈0.79.
+**Current best (RMSNorm/F=1497): 3.51 ms = ~16% faster than Triton (do_bench).** Gate now **cuBLAS** (unpadded K,
+op_N/op_T layout with M column-major, ≈1.18 ms vs CUTLASS 1.25; the padded-K route was a TRAP — Pp-copy costs
+0.56 ms, dwarfs the ~0.15 GEMM saving). Still SHORT of the 20% bar (3.38). Per-stage (≈ms): stats(M,R,N)≈0.86 ·
+gate≈1.18 (cuBLAS) · sigpad≈0.56 · pool≈0.79.
 
 **Prior best (OLD LayerNorm/F=1491, for the record):** 3.465 ms (C gate-NOSIG + vecsigpad, GEM) ;
 3.670 ms (B hand-written CUDA+PTX WGMMA gate at CUTLASS parity, 1.255 ms gate, persistent + TMA-store epilogue).

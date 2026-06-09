@@ -12,7 +12,17 @@ When you hit a gem, drop a timestamped subfolder here, e.g. `GEMS/2026-06-07-wgm
 
 Only put REAL, reproducible wins here. This folder is the record of what actually worked.
 
-## CURRENT GLOBAL BEST: 3.465 ms (2026-06-08-c-gate-nosig-vecsigpad, branch C) — aggregator-verified
+## CURRENT GLOBAL BEST: 3.499 ms (MAIN, RMSNorm/F=1497 oracle) — aggregator-verified 2026-06-09
+
+> SPEC NOTE: The competition reference was migrated LayerNorm->RMSNorm/F=1497 (committed to
+> main e33f072, oracle cuda/gist_ref.py @22:34). The prior 3.465ms (c-gate-nosig-vecsigpad)
+> was earned vs the now-RETIRED LayerNorm/F=1491 oracle and is NO LONGER the valid global best.
+> New verified best is MAIN's RMSNorm kernel: aggregator independently re-ran the committed
+> cuda/gist.cu on an isolated /tmp copy (GPU4, rev90001 big shape) = min 3.4992ms,
+> correctness PASS (max_abs 0.015625, mean 3.09e-6, 0/1536). Only kernel_run exported
+> (single extern "C"); cheat-grep ZERO; 182 wgmma/bf16 sites live; 3.499 is honestly
+> ~slightly slower than the stale 3.465, no too-good signal. New Triton/RMSNorm bar 4.1519ms
+> => -15.7%. New min-20% bar = 3.32ms (still above), 30% target = 2.91ms.
 
 ## Ledger (newest first)
 - **2026-06-08-c-gate-nosig-vecsigpad** — **3.465 ms** bf16, correctness PASSED (max_abs 0.03125, mean 3.15e-6, 0/1536).

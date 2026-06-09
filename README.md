@@ -50,17 +50,17 @@ Same precision (bf16), `triton.testing.do_bench` (warmup + L2-flush + median), a
 | method (bf16) | latency |
 |---|---|
 | PyTorch eager | 12.5 ms |
-| PyTorch `compile` | 4.30 ms |
-| Triton-fast (`gist_triton_fast_forward`) | 4.22 ms |
-| **CUDA + inline PTX (`cuda/gist.cu`)** | **3.62 ms** |
+| PyTorch `compile` | 4.29 ms |
+| Triton-fast (`gist_triton_fast_forward`) | 4.20 ms |
+| **CUDA (`cuda/gist.cu`)** | **3.51 ms** |
 
-The hand-written **CUDA + inline-PTX (Hopper WGMMA) kernel is the fastest — ~14 % faster than
-Triton-fast**, ~16 % vs `torch.compile`. The lever is the gate GEMM: Triton's `tl.dot` gate reaches only
-~37 % of the tensor pipe (≈2.6 ms), and `compile` burns ~1.85 ms in memory-bound glue (transpose P,
-materialize N, sigmoid); both the Triton and CUDA kernels fuse that glue away, and the CUDA kernel's
-**WGMMA gate runs at ≈1.25 ms**.
+The **CUDA kernel (`cuda/gist.cu`) is the fastest — ~16 % faster than Triton-fast**, ~18 % vs
+`torch.compile`. The lever is the gate GEMM: Triton's `tl.dot` gate reaches only ~37 % of the tensor pipe
+(≈2.6 ms), and `compile` burns ~1.85 ms in memory-bound glue (transpose P, materialize N, sigmoid); the
+CUDA kernel avoids both — a **cuBLAS gate at ≈1.18 ms** (a hand-written inline-PTX WGMMA gate reaches the
+same ~1.2 ms, kept env-gated) plus a CUTLASS pool and hand-written stats / sigmoid-pad passes.
 
-Per-kernel µs — Triton: gate 2.64 · pool 1.19 · stats 0.41.  CUDA: gate ≈1.25 · pool ≈0.79 · sigpad ≈0.56
+Per-kernel ms — Triton: gate 2.64 · pool 1.19 · stats 0.41.  CUDA: gate ≈1.18 · pool ≈0.79 · sigpad ≈0.56
 · stats ≈0.86. (This box runs ~2.07 TB/s HBM and ~807 TFLOP/s bf16 tensor, both below datasheet, so the
 gate at ~700 TFLOP/s is already near its compute ceiling here.)
 
@@ -90,10 +90,9 @@ would force a 3D pool accumulator that wrecks occupancy).
 
 ## Status & next steps
 
-**Status:** forward-only; **done and validated on H100**. Fastest is the hand-written **CUDA +
-inline-PTX kernel** (`cuda/gist.cu`) at **3.62 ms — ~14 % faster than Triton-fast (4.22 ms)** by
-replacing the `tl.dot` gate with a WGMMA gate; the Triton path (3 autotuned kernels, stats → gate
-GEMM → fused pool) is ~2 % faster than `torch.compile`. See Results above; v1 (`gist_triton.py`)
+**Status:** forward-only; **done and validated on H100**. Fastest is the **CUDA kernel**
+(`cuda/gist.cu`) at **3.51 ms — ~16 % faster than Triton-fast (4.20 ms)** via a fast tensor-core gate
+(cuBLAS, ≈1.18 ms) replacing Triton's slow `tl.dot` gate. See Results above; v1 (`gist_triton.py`)
 kept for reference.
 
 Environment: `.venv` (uv-managed CPython, not Meta python) with torch 2.12 + triton 3.7.

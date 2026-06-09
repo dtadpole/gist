@@ -29,7 +29,7 @@ cmd = ["/usr/local/cuda-13.0/bin/nvcc", "-shared", "-Xcompiler", "-fPIC", "-O3",
        "-gencode", "arch=compute_90a,code=sm_90a", "-o", so, os.path.expanduser("~/gist/cuda/gist.cu"),
        f"-I{CUT}", f"-I{CUTU}", f"-I{INC}", f"-I{CCCL}", f"-I{NVML}",
        f"-L{LIB}", f"-L{STUB}", "-L/usr/local/cuda-13.0/lib64", "-Xlinker", f"-rpath={LIB}",
-       "--expt-relaxed-constexpr", "-DCUTLASS_ENABLE_GDC_FOR_SM90", "-lcudart"]
+       "--expt-relaxed-constexpr", "-DCUTLASS_ENABLE_GDC_FOR_SM90", "-lcublas", "-lcudart"]
 print("building...", flush=True)
 r = subprocess.run(cmd, env={**os.environ, "LD_LIBRARY_PATH": LIB}, capture_output=True, text=True)
 if r.returncode != 0:
