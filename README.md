@@ -43,6 +43,7 @@ Design defaults (large-scale target): `B=1536, F=1497, D=192, Q=128`.
 | `bench.py` | Benchmark vs PyTorch eager / `torch.compile` across fp32/tf32/bf16: latency, speedup, achieved TFLOP/s, rel & abs error. |
 | `test_gist.py` | Hardened correctness test: 5 seeds × {bf16,tf32} × {design shape, masking edge case}, asserts rel-Frobenius vs fp32 truth **and** vs same-precision PyTorch. |
 | `cuda/gist.cu` | **Hand-written CUDA + inline-PTX (Hopper WGMMA)** forward — the fastest impl (3 fused kernels: stats → σ+pad gate → inline-N pool). Run via the `cuda_exec` harness (`./run_gist.sh`). |
+| `GEMS/2026-06-09-gist-c-phase4-integrated-nopadmask/` | **Best kernel snapshot** (branch-C Phase 4, **2.52 ms**): the exact `gist.cu` that set the record, plus `algorithm.md` (design walkthrough), `results.md`, and `correctness_big.json`. This is the canonical reference for the best result below. |
 
 Run on a CUDA box with the `.venv` (uv-managed CPython, torch 2.12 + triton 3.7); pin an idle GPU via
 `CUDA_VISIBLE_DEVICES`. `bench.py` / `test_gist.py` exercise the Triton path; `run_gist.sh` the CUDA kernel.
@@ -75,8 +76,9 @@ Two fusions are the win: the gate writes padded `SL` directly (deletes the separ
 and the pool computes `N` inline (deletes the ~0.9 GB `N` round-trip). Triton instead pays a slow `tl.dot`
 gate (~2.6 ms); `compile` pays ~1.85 ms of memory-bound glue.
 
-> Repro: `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`
-> (kernel snapshot: `GEMS/2026-06-09-gist-c-phase4-integrated-nopadmask/`).
+> Repro: `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`.
+> Best kernel snapshot — source + design walkthrough — is
+> `GEMS/2026-06-09-gist-c-phase4-integrated-nopadmask/` (`gist.cu`, `algorithm.md`, `results.md`).
 
 **Correctness:** the kernel passes the `cuda_exec` harness (max_abs 0.0156, 0/1536). The Triton path passes
 `test_gist.py` (20 checks: 5 seeds × {bf16,tf32} × {design shape, masking edge}), bf16 rel-Frobenius
