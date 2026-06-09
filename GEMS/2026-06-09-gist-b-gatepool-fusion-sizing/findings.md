@@ -38,3 +38,21 @@
 Build the b_off-blocked relaunch + L2 window, measure the pool's lts hit-rate on SL and pool time for
 ONE block. If SL L2-hit rises (>~70%) and pool block-time drops proportionally → continue + tune block
 size. If L2 reuse doesn't materialize (Pp/X still evict) → STOP, hold at 2.52, document.
+
+## GO/NO-GO PROBE RESULT (2026-06-09): NO-GO — L2-persist does NOT capture the SL round-trip
+Built the b_off-blocked relaunch (BLK=128) + `cudaLimitPersistingL2CacheSize=max` + per-block
+`accessPolicyWindow(base=SL[block], hitProp=persisting, missProp=streaming)`. Reused the verified gate+pool
+kernels via a `b_off` batch-offset (isolated in /tmp/gist_probe.cu; production source untouched). PASS,
+max_abs 0.015625.
+
+NCU pool, per 128-batch block: **dram_read = 125 MB = full SL(50 MB) + X(74 MB)** → the pool read SL
+**entirely from DRAM**; lts hit **25.4%** (below the 30.8% baseline). **SL capture ≈ 0%, far below the ~70%
+go/no-go bar → NO-GO.** Root cause (as predicted): the gate streams its 0.59 GB `Pp` weight while producing
+each SL block, evicting the 50 MB SL persist region (block can't drop below 128 — the gate M-tile — so SL-block
+≥ 50 MB exceeds the persist region anyway). End-to-end probe time 7.16 ms (relaunch/setattr overhead; irrelevant
+to the L2-capture verdict).
+
+**Conclusion: gate→pool fusion is not capturable** — on-chip data-fusion is infeasible (orthogonal gate
+M=B / pool M=Q tilings) AND the L2-residency workaround is disproven by measurement. **HOLD at 2.52 ms.**
+All three kernels (stats 92% BW, gate 78% tensor = CUTLASS parity, pool 87% BW) are at their ceilings; no
+remaining structural lever identified for this kernel architecture/shape.
