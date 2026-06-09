@@ -56,3 +56,15 @@ to the L2-capture verdict).
 M=B / pool M=Q tilings) AND the L2-residency workaround is disproven by measurement. **HOLD at 2.52 ms.**
 All three kernels (stats 92% BW, gate 78% tensor = CUTLASS parity, pool 87% BW) are at their ceilings; no
 remaining structural lever identified for this kernel architecture/shape.
+
+## GATE FORCED-LEVER SWEEP (2026-06-09): cluster-multicast + Stream-K MEASURED-irrelevant
+After the fusion NO-GO, audited the gate's two remaining untried levers (NCU rev88032 gate, GATEPAD+NOPADMASK):
+DRAM 27.85%, L2 (lts) hit 86.9%, L1 99.9%, launch waves/SM = 1, hmma 78.8%, SM 77.9%.
+- **TMA-multicast of shared Pp (2-CTA cluster): no headroom.** Gate is tensor-bound at 28% DRAM (not HBM-bound)
+  and Pp is already 86.9% L2-hit — the batched-GEMV's shared-Pp reuse is captured by L2; multicast cuts traffic
+  the kernel doesn't need cut. (Matches CUTLASS choosing ClusterShape<1,1,1> for this gate.)
+- **Stream-K tail: no headroom.** 1 wave (persistent grid-stride, 9216 tiles >> 132 CTAs) ⇒ tail ≈ 1.4%.
+  Stream-K is a few-tiles-per-SM lever; N/A in this many-tiles regime.
+The 22% idle is the per-tile epilogue barrier (45.5% stall), already proven irreducible (debar/pwg). Gate at
+78% tensor = CUTLASS parity = ~88% of the real 800 TFLOP/s executed-FLOP floor (1.16 ms). **All forced gate
+levers now MEASURED-exhausted; HOLD 2.52 ms.**
