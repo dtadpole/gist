@@ -45,21 +45,29 @@ Design defaults (large-scale target): `B=1536, F=1497, D=192, Q=128`.
 
 ## Results (single H100, B=1536 F=1497 D=192 Q=128, ~994 GFLOP/call)
 
-Same-precision comparison (speedup vs eager **of the same dtype**; error vs fp32 truth).
-Measured with RMSNorm values (`bench.py`, median of 20 iters):
+Same-precision comparison (bf16). Measured **interleaved** (alternating Triton/compile each
+iteration so both see identical GPU clocks — the apples-to-apples way; `bench.py`'s sequential
+timing perturbs clocks by running the 257 ms v1 kernel first):
 
-| method (bf16) | latency | speedup vs eager-bf16 | rel-err |
-|---|---|---|---|
-| PyTorch eager | 12.62 ms | 1.00× | 4.8e-3 |
-| PyTorch `compile` | 4.38 ms | 2.89× | 4.1e-3 |
-| **Triton-fast** | **4.40 ms** | **2.87×** | 4.1e-3 |
+| method (bf16) | latency | rel-err vs fp32 |
+|---|---|---|
+| PyTorch eager | 12.6 ms | 4.8e-3 |
+| PyTorch `compile` | 4.42 ms | 4.1e-3 |
+| **Triton-fast** | **4.31 ms** | 4.1e-3 |
 
-The bf16 fast kernel **ties `torch.compile`** at the same precision (~4.4 ms, ~227 TFLOP/s
-total; the two are within run-to-run noise). The gate GEMM dominates the cost (~0.88 of the
-~0.99 TFLOP). With LayerNorm (the earlier reference, F=1491) the kernel was ~10% ahead of
-`compile`; under the cheaper RMSNorm value path `compile`'s fused inductor kernel closes that
-gap. The tf32 variant (12.8 ms) loses to `compile`-tf32 (7.9 ms): cuBLAS's tf32 GEMM inside
-`compile` is hard to beat with a multi-kernel Triton design.
+The bf16 fast kernel is **~2.6 % faster than `torch.compile`** at the same precision (stable
+across runs, non-overlapping p5–p95 bands). It does it with **3 fused kernels** vs compile's
+**6**: NCU shows compile spends ~1.85 ms in pure memory-bound "glue" (transpose P, materialize
+N, apply sigmoid — each 82–90 % DRAM) that Triton fuses away, in exchange for a fast CUTLASS
+gate (1.21 ms). Triton instead pays a slower gate (2.6 ms — its `tl.dot` reaches only ~37 % of
+the tensor pipe vs CUTLASS's wgmma), but zero glue — and the fusion saving slightly exceeds the
+gate deficit. The tf32 variant (~12.8 ms) loses to `compile`-tf32 (~7.9 ms): cuBLAS's tf32 GEMM
+inside `compile` is hard to beat with a multi-kernel Triton design.
+
+Per-kernel (Triton, profiler µs): gate GEMM **2.64** (tensor-bound, the wall) · pool **1.19**
+(RMSNorm fused in; D split 128+64 to avoid the 192→256 pad) · stats **0.41** (88 % DRAM). The
+gate is the only real headroom and is unreachable in pure Triton — closing it needs a
+CUTLASS-class wgmma gate (the hand CUDA+PTX path).
 
 **Correctness:** validated against an fp32 reference with `init_unit_scale_` (so `O ~ O(1)` and
 tolerances are meaningful). `test_gist.py` passes all 20 checks (5 seeds × {bf16,tf32} ×
@@ -86,9 +94,9 @@ would force a 3D pool accumulator that wrecks occupancy).
 
 ## Status & next steps
 
-**Status:** forward-only; **done and validated on H100**. The fast bf16 kernel ties
-`torch.compile` at matching precision (~4.4 ms) — see Results above. Three autotuned
-kernels (stats → gate GEMM → fused pool); v1 kept for reference.
+**Status:** forward-only; **done and validated on H100**. The fast bf16 kernel is ~2.6 %
+faster than `torch.compile` at matching precision (4.31 vs 4.42 ms) — see Results above.
+Three autotuned kernels (stats → gate GEMM → fused pool); v1 kept for reference.
 
 Environment: `.venv` (uv-managed CPython, not Meta python) with torch 2.12 + triton 3.7.
 Run `.venv/bin/python bench.py` (pin an idle GPU with `CUDA_VISIBLE_DEVICES`).

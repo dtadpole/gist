@@ -143,18 +143,23 @@ def _gate_kernel(
 # --------------------------------------------------------------------------- #
 # kernel 2 — pool: O = sum_g L[:,:,g] * N[:,g,:], N = RMSNorm(X) on the fly
 #                  (N = X * rrms * W; no centering, per-(feature,channel) W [F,D])
+#
+# The D axis is split into TWO power-of-2 tiles (D0 + D1) instead of one padded
+# BLOCK_D >= D. For the design D=192 this is 128 + 64 with ZERO padding waste,
+# vs a single 256-wide tile that wastes 25% of the accumulator and every dot on
+# dead columns. Smaller accumulators -> higher occupancy -> the memory-bound
+# pool hides latency better (measured ~1.23 -> ~1.15 ms at the design shape).
 # --------------------------------------------------------------------------- #
 def _pool_configs():
     # larger BLOCK_Q -> X re-read fewer times (X is reloaded once per q-block).
     base = [
-        (64, 32, 3, 4),
-        (128, 32, 2, 4),
         (128, 32, 2, 8),
         (128, 32, 3, 8),
+        (128, 32, 4, 8),
         (64, 64, 2, 4),
         (64, 64, 2, 8),
+        (64, 32, 2, 4),
         (128, 64, 2, 8),
-        (128, 64, 2, 4),
     ]
     return [triton.Config({"BLOCK_Q": q, "BLOCK_G": g}, num_stages=s, num_warps=w)
             for (q, g, s, w) in base]
@@ -174,45 +179,71 @@ def _pool_kernel(
     IS_BF16: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_G: tl.constexpr,
-    BLOCK_D: tl.constexpr,         # >= D
+    D0: tl.constexpr,              # first D-tile width  (pow2, always <= D)
+    D1: tl.constexpr,              # second D-tile width (pow2; D0+D1 >= D)
 ):
     b = tl.program_id(0)
     pid_q = tl.program_id(1)
     q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
     q_mask = q < Q
-    d = tl.arange(0, BLOCK_D)
-    d_mask = d < D
+    d0 = tl.arange(0, D0)                 # [0, D0)        — all valid (D0 <= D)
+    d1 = D0 + tl.arange(0, D1)            # [D0, D0+D1)    — mask d1 < D
+    d1_mask = d1 < D
 
-    acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_Q, D0), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_Q, D1), dtype=tl.float32)
     for g0 in range(0, F, BLOCK_G):
         g = g0 + tl.arange(0, BLOCK_G)
         g_mask = g < F
         # gate tile L[b, q-block, g-block] -> [BQ, BG]
         l = tl.load(L + b * sl_b + q[:, None] * sl_q + g[None, :] * sl_g,
                     mask=q_mask[:, None] & g_mask[None, :], other=0.0)
-        # value tile N[b, g-block, :] = RMSNorm(X) on the fly -> [BG, BD]
-        x = tl.load(X + b * sx_b + g[:, None] * sx_f + d[None, :] * sx_d,
-                    mask=g_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-        rg = tl.load(R + b * sr_b + g * sr_f, mask=g_mask, other=0.0).to(tl.float32)
-        n = x * rg[:, None]                      # RMSNorm: scale by rrms, no centering
+        rg = tl.load(R + b * sr_b + g * sr_f, mask=g_mask, other=0.0).to(tl.float32)  # [BG]
+        lb = l.to(tl.bfloat16) if IS_BF16 else l
+        # value tile N = RMSNorm(X) on the fly, per D-tile: N = X * rrms * W
+        x0 = tl.load(X + b * sx_b + g[:, None] * sx_f + d0[None, :] * sx_d,
+                     mask=g_mask[:, None], other=0.0).to(tl.float32)
+        n0 = x0 * rg[:, None]
+        x1 = tl.load(X + b * sx_b + g[:, None] * sx_f + d1[None, :] * sx_d,
+                     mask=g_mask[:, None] & d1_mask[None, :], other=0.0).to(tl.float32)
+        n1 = x1 * rg[:, None]
         if HAS_AFFINE:
-            w = tl.load(W + g[:, None] * sw_f + d[None, :] * sw_d,
-                        mask=g_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)  # [BG, BD]
-            n = n * w
-        n = tl.where(g_mask[:, None], n, 0.0)   # padded g (g>=F) must not contribute
+            w0 = tl.load(W + g[:, None] * sw_f + d0[None, :] * sw_d,
+                         mask=g_mask[:, None], other=0.0).to(tl.float32)
+            n0 = n0 * w0
+            w1 = tl.load(W + g[:, None] * sw_f + d1[None, :] * sw_d,
+                         mask=g_mask[:, None] & d1_mask[None, :], other=0.0).to(tl.float32)
+            n1 = n1 * w1
+        n0 = tl.where(g_mask[:, None], n0, 0.0)   # padded g (g>=F) must not contribute
+        n1 = tl.where(g_mask[:, None], n1, 0.0)
 
         if IS_BF16:
-            acc += tl.dot(l.to(tl.bfloat16), n.to(tl.bfloat16), out_dtype=tl.float32)
+            acc0 += tl.dot(lb, n0.to(tl.bfloat16), out_dtype=tl.float32)
+            acc1 += tl.dot(lb, n1.to(tl.bfloat16), out_dtype=tl.float32)
         else:
-            acc += tl.dot(l, n, out_dtype=tl.float32, input_precision="tf32")
+            acc0 += tl.dot(lb, n0, out_dtype=tl.float32, input_precision="tf32")
+            acc1 += tl.dot(lb, n1, out_dtype=tl.float32, input_precision="tf32")
 
-    o = acc.to(tl.bfloat16) if IS_BF16 else acc
-    tl.store(O + b * so_b + q[:, None] * so_q + d[None, :] * so_d, o,
-             mask=q_mask[:, None] & d_mask[None, :])
+    o0 = acc0.to(tl.bfloat16) if IS_BF16 else acc0
+    o1 = acc1.to(tl.bfloat16) if IS_BF16 else acc1
+    tl.store(O + b * so_b + q[:, None] * so_q + d0[None, :] * so_d, o0, mask=q_mask[:, None])
+    tl.store(O + b * so_b + q[:, None] * so_q + d1[None, :] * so_d, o1,
+             mask=q_mask[:, None] & d1_mask[None, :])
 
 
 def _next_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
+
+
+def _split_d(D: int) -> tuple[int, int]:
+    """Split D into two power-of-2 tile widths (D0, D1) with D0 + D1 >= D, D0 <= D.
+
+    D0 = half the next-pow2 of D; D1 covers the remainder. For D=192 -> (128, 64),
+    an exact split with no padding waste. For D already a pow2 -> (D/2, D/2)."""
+    bd = _next_pow2(D)
+    d0 = bd // 2
+    d1 = _next_pow2(D - d0)
+    return d0, d1
 
 
 def gist_triton_fast_forward(
@@ -263,6 +294,7 @@ def gist_triton_fast_forward(
 
     L3 = L.view(B, Q, F)                                  # L[b, q, g] = Lflat[b, q*F+g]
     o = torch.empty((B, Q, D), device=x.device, dtype=x.dtype)
+    d0, d1 = _split_d(D)                                  # two pow2 D-tiles (192 -> 128+64)
     pool_grid = lambda META: (B, triton.cdiv(Q, META["BLOCK_Q"]))
     _pool_kernel[pool_grid](
         L3, x, r, weight, o,
@@ -273,7 +305,7 @@ def gist_triton_fast_forward(
         weight.stride(0), weight.stride(1),
         o.stride(0), o.stride(1), o.stride(2),
         HAS_AFFINE=has_affine, IS_BF16=is_bf16,
-        BLOCK_D=BLOCK_D,
+        D0=d0, D1=d1,
     )
     return o
 
