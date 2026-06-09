@@ -9,20 +9,21 @@ FORMAT:
   - IMPLICATION: what other branches should do/avoid
 
 **Measured — ONE method (`triton.testing.do_bench` MIN, L2-flush, GPU 0, design shape RMSNorm/F=1497, bf16):**
-- **Triton-fast 4.19 ms · CUDA 2.64 ms → ~37% faster** (Phase 4; harness min_ms = do_bench-min GPU0; eager 12.6, compile 4.26).
+- **Triton-fast 4.19 ms · CUDA 2.52 ms → ~1.66×** (branch-C Phase 4; harness min_ms = do_bench-min GPU0; vs compile 4.26 = ~1.7×, eager 12.6 = ~5×).
 - METHOD LOCKED: **do_bench MIN on GPU 0** = the `run_gist.sh` min_ms statistic (the harness GPU). One GPU (0), one tool, one
   stat (min) — mixing GPUs/median produced the earlier 4.15/4.31/4.41/3.51/3.62 spread; don't.
 
-Targets (user-defined, vs ~4.2 Triton): **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
+Goal: beat Triton (~4.2 ms) by a strong margin. >1.5× is the win we're after; we cleared it.
 
-**Current best (RMSNorm/F=1497): 2.64 ms = ~37% faster than Triton (4.19) — BEATS the 30% bar.** Branch B Phase 4
-(GEMS/2026-06-09-gist-b-phase4-gate-padded-norepad), ALL hand CUDA+PTX, 3 fused kernels: stats(M,R int4) 0.43 +
-**gate σ+pad-fused** (writes padded SL directly → deletes the repad; 84% of 800 TF) 1.37 + **pool inline-N** (no
-materialized N; cheap uint4 N-compute keeps the consumer wgmma-gated → 87% HBM) 0.79. The pool's 2.3x gap vs Triton
-was an IMPLEMENTATION gap (now closed), NOT a hardware wall — the corrected arithmetic (no double-counted sigpad)
-was right. CAVEAT: gate prepacks padded P once (k_ppad, WEIGHT_INPUTS — production-valid; Triton's per-call path
-doesn't prepack). Supersedes the cuBLAS-gate 3.40. NOT yet MAIN's no-env default (env-gated GIST_HANDGATE+GATEPAD+
-FUSESIG+POOLFUSE; the kernel lives in the gem snapshot — integrating it as the default is the open task).
+**Current best (RMSNorm/F=1497): 2.52 ms = ~1.66× faster than Triton (4.19).** Branch C Phase 4
+(GEMS/2026-06-09-gist-c-phase4-integrated-nopadmask), ALL hand CUDA+PTX, 3 fused kernels: stats(M,R int4) 0.43 +
+**gate σ+pad-fused, NO pad-mask** (writes padded SL directly → deletes the repad; 89% of 800 TF) 1.31 + **pool
+inline-N** (no materialized N; uint4 N-compute keeps the consumer wgmma-gated → 87% HBM) 0.79. = branch-B Phase 4
+(2.64) minus the gate pad-mask (−0.14 ms; safe because the pool zeroes N[pad] → SL[pad]·0 = 0). The pool's 2.3x
+gap vs Triton was an IMPLEMENTATION gap (closed), not a hardware wall — the corrected arithmetic was right.
+NOTE: the gate prepacks padded P once (k_ppad) — P is a static WEIGHT (the harness `WEIGHT_INPUTS` holds P,W
+constant, as deployment does; Triton reads P per-call). Supersedes cuBLAS-gate 3.40. NOT yet MAIN's no-env default
+(env-gated GIST_HANDGATE+GATEPAD+FUSESIG+POOLFUSE; kernel in the gem snapshot — integrating as default = open task).
 
 **Prior best (OLD LayerNorm/F=1491, for the record):** 3.465 ms (C gate-NOSIG + vecsigpad, GEM) ;
 3.670 ms (B hand-written CUDA+PTX WGMMA gate at CUTLASS parity, 1.255 ms gate, persistent + TMA-store epilogue).

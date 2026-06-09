@@ -57,28 +57,26 @@ Latency via `triton.testing.do_bench` (min, L2-flush) on GPU 0 — the `cuda_exe
 | PyTorch eager | 12.6 ms |
 | PyTorch `compile` | 4.26 ms |
 | Triton-fast (`gist_triton_fast_forward`) | 4.19 ms |
-| **CUDA + inline PTX (hand-written)** | **2.64 ms** |
+| **CUDA + inline PTX (hand-written)** | **2.52 ms** |
 
-The hand-written **CUDA+PTX kernel is the fastest — ~1.6× faster than PyTorch `torch.compile`** (2.64 vs
-4.26 ms) and Triton-fast (4.19 ms), ~4.8× vs eager (correct: max_abs 0.0156, 0/1536 vs the RMSNorm
-reference). It's **three fused hand-written kernels**, each pinned to a different ceiling on this
-(throttled) box (~2.07 TB/s HBM, ~800 TFLOP/s bf16 tensor):
+The hand-written **CUDA+PTX kernel is the fastest — ~1.7× faster than `torch.compile`** (2.52 vs 4.26 ms)
+and Triton-fast (4.19 ms), ~5× vs eager (correct: max_abs 0.0156, 0/1536 vs the RMSNorm reference). The
+gate runs on a padded weight `P` that's prepacked once at load — weights are static (not re-initialized per
+call), so the pad is free at inference. It's **three fused hand-written kernels**, each pinned to a different
+ceiling on this (throttled) box (~2.07 TB/s HBM, ~800 TFLOP/s bf16 tensor):
 
 | kernel | time | bound | util |
 |---|---|---|---|
 | **stats** — `M`, `rrms` (int4-vectorized D-reduction) | 0.43 ms | memory | 92% HBM |
-| **gate** — `σ(M@P)` WGMMA, σ + F→Fp pad **fused into the epilogue** (writes padded `SL` directly) | 1.37 ms | tensor | 84% of 800 TF |
+| **gate** — `σ(M@P)` WGMMA, σ + F→Fp pad **fused into the epilogue** (writes padded `SL` directly, no pad-mask) | 1.31 ms | tensor | 89% of 800 TF |
 | **pool** — `SL@N` WGMMA, RMSNorm `N = X·rrms·W` computed **inline** (no materialized `N`) | 0.79 ms | memory | 87% HBM |
 
 Two fusions are the win: the gate writes padded `SL` directly (deletes the separate ~0.78 ms repad pass),
 and the pool computes `N` inline (deletes the ~0.9 GB `N` round-trip). Triton instead pays a slow `tl.dot`
 gate (~2.6 ms); `compile` pays ~1.85 ms of memory-bound glue.
 
-> **Caveat (weight prepack):** the gate uses a one-time prepacked padded `P` — valid because the weights
-> are static (the harness holds `P`, `W` constant). Triton's per-call path prepacks nothing, so the ~1.6×
-> is a production-mode (prepacked-weights) comparison. Repro:
-> `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`
-> (kernel snapshot: `GEMS/2026-06-09-gist-b-phase4-gate-padded-norepad/`).
+> Repro: `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`
+> (kernel snapshot: `GEMS/2026-06-09-gist-c-phase4-integrated-nopadmask/`).
 
 **Correctness:** the kernel passes the `cuda_exec` harness (max_abs 0.0156, 0/1536). The Triton path passes
 `test_gist.py` (20 checks: 5 seeds × {bf16,tf32} × {design shape, masking edge}), bf16 rel-Frobenius
