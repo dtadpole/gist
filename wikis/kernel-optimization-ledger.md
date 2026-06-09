@@ -9,17 +9,20 @@ FORMAT:
   - IMPLICATION: what other branches should do/avoid
 
 **Measured — ONE method (`triton.testing.do_bench` MIN, L2-flush, GPU 0, design shape RMSNorm/F=1497, bf16):**
-- **Triton-fast 4.19 ms · CUDA `cuda/gist.cu` 3.42 ms → ~18% faster** (do_bench MIN, GPU0; eager 12.6, compile 4.26).
-- METHOD LOCKED: **do_bench MIN on GPU 0** (= the harness GPU + the `run_gist.sh` min_ms statistic; harness reports CUDA 3.40,
-  matching do_bench-min 3.42). The earlier "3.51 / ~16%" was GPU 7 + median (slower GPU + wrong statistic). Mixing GPUs/
-  statistics produced the whole 4.15/4.31/4.41/3.51/3.62 spread — DON'T. One GPU (0), one tool (do_bench), one stat (min).
+- **Triton-fast 4.19 ms · CUDA 2.64 ms → ~37% faster** (Phase 4; harness min_ms = do_bench-min GPU0; eager 12.6, compile 4.26).
+- METHOD LOCKED: **do_bench MIN on GPU 0** = the `run_gist.sh` min_ms statistic (the harness GPU). One GPU (0), one tool, one
+  stat (min) — mixing GPUs/median produced the earlier 4.15/4.31/4.41/3.51/3.62 spread; don't.
 
 Targets (user-defined, vs ~4.2 Triton): **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
 
-**Current best (RMSNorm/F=1497): 3.42 ms (do_bench min GPU0 = harness min_ms 3.40) = ~18% faster than Triton (4.19).** Gate **cuBLAS** (unpadded K,
-op_N/op_T layout with M column-major, ≈1.18 ms vs CUTLASS 1.25; the padded-K route was a TRAP — Pp-copy costs
-0.56 ms, dwarfs the ~0.15 GEMM saving). Still SHORT of the 20% bar (3.38). Per-stage (≈ms): stats(M,R,N)≈0.86 ·
-gate≈1.18 (cuBLAS) · sigpad≈0.56 · pool≈0.79.
+**Current best (RMSNorm/F=1497): 2.64 ms = ~37% faster than Triton (4.19) — BEATS the 30% bar.** Branch B Phase 4
+(GEMS/2026-06-09-gist-b-phase4-gate-padded-norepad), ALL hand CUDA+PTX, 3 fused kernels: stats(M,R int4) 0.43 +
+**gate σ+pad-fused** (writes padded SL directly → deletes the repad; 84% of 800 TF) 1.37 + **pool inline-N** (no
+materialized N; cheap uint4 N-compute keeps the consumer wgmma-gated → 87% HBM) 0.79. The pool's 2.3x gap vs Triton
+was an IMPLEMENTATION gap (now closed), NOT a hardware wall — the corrected arithmetic (no double-counted sigpad)
+was right. CAVEAT: gate prepacks padded P once (k_ppad, WEIGHT_INPUTS — production-valid; Triton's per-call path
+doesn't prepack). Supersedes the cuBLAS-gate 3.40. NOT yet MAIN's no-env default (env-gated GIST_HANDGATE+GATEPAD+
+FUSESIG+POOLFUSE; the kernel lives in the gem snapshot — integrating it as the default is the open task).
 
 **Prior best (OLD LayerNorm/F=1491, for the record):** 3.465 ms (C gate-NOSIG + vecsigpad, GEM) ;
 3.670 ms (B hand-written CUDA+PTX WGMMA gate at CUTLASS parity, 1.255 ms gate, persistent + TMA-store epilogue).
@@ -29,10 +32,16 @@ gate≈1.18 (cuBLAS) · sigpad≈0.56 · pool≈0.79.
 - bf16 tensor peak: **~807 TFLOP/s** (cuBLAS 8192³), NOT 989 datasheet. Gate runs at ~700 TF = ~88% of this real peak → near its compute ceiling.
 
 **Convergent verdicts (all measured, multi-branch):** the win is NOT in the GEMMs (we already beat Triton on
-both gate and pool) — it's the helpers (stats N-write + repad) that Triton fuses away. But the hand fused pool
-is a software-relayout DEAD-END (~2.7 ms, SM-issue-bound; CUTLASS does the relayout in hardware via TMA at
-0.79 ms). The genuine "ptxas warp-3 acc[32] bug" was a missing `fence.proxy.async.shared::cta` (SOLVED). The
-gate is at the throttled compute ceiling; gate-mainloop occupancy (PINGPONG/stages/cluster) is exhausted.
+both gate and pool) — it's the helpers (stats N-write + sigpad) that Triton fuses away via its UNPADDED-masked-read
+fused pool. CORRECTION (prior "fused-pool DEAD-END / 30% impossible" was WRONG — it double-counted sigpad AND a
+1.19ms fused pool; Triton's 1.19ms pool IS the unpadded path that HAS no sigpad). The real 30% arithmetic:
+gate 1.18 + stats_mr 0.42 + UNPADDED fused pool 1.19 = **2.79 ms = 30%**. Triton hits 1.19ms on this exact
+shape/HW = EXISTENCE PROOF it's reachable; our hand unpadded fused pool ~2.7ms is a **~2.3x IMPLEMENTATION gap,
+NOT a hardware wall**. UNEXHAUSTED LEVER (underway): NCU/nsys side-by-side Triton's pool vs ours to find & close
+the 2.3x gap (pipelining depth / masked-load vectorization / layout). TMA path is separately blocked (odd-F=1497
+fails cuTensorMapEncodeTiled → forces padded → sigpad), but the masked (non-TMA) unpadded read is Triton's path
+and is open. The genuine "ptxas warp-3 acc[32] bug" was a missing `fence.proxy.async.shared::cta` (SOLVED). The
+gate is at the throttled compute ceiling; gate-mainloop occupancy is exhausted — but the POOL is the live lever.
 
 ---
 

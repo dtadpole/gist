@@ -42,71 +42,54 @@ Design defaults (large-scale target): `B=1536, F=1497, D=192, Q=128`.
 | `gist_triton_fast.py` | **Fast** forward (`gist_triton_fast_forward`, `precision="bf16"`/`"tf32"`): three autotuned kernels — stats (`M,rrms`) → gate GEMM (`L=sigmoid(M@P)`, batch-tiled tensor-core, L2-grouped) → fused pool/RMSNorm. |
 | `bench.py` | Benchmark vs PyTorch eager / `torch.compile` across fp32/tf32/bf16: latency, speedup, achieved TFLOP/s, rel & abs error. |
 | `test_gist.py` | Hardened correctness test: 5 seeds × {bf16,tf32} × {design shape, masking edge case}, asserts rel-Frobenius vs fp32 truth **and** vs same-precision PyTorch. |
+| `cuda/gist.cu` | **Hand-written CUDA + inline-PTX (Hopper WGMMA)** forward — the fastest impl (3 fused kernels: stats → σ+pad gate → inline-N pool). Run via the `cuda_exec` harness (`./run_gist.sh`). |
 
-## Results (single H100, B=1536 F=1497 D=192 Q=128, ~994 GFLOP/call)
+Run on a CUDA box with the `.venv` (uv-managed CPython, torch 2.12 + triton 3.7); pin an idle GPU via
+`CUDA_VISIBLE_DEVICES`. `bench.py` / `test_gist.py` exercise the Triton path; `run_gist.sh` the CUDA kernel.
 
-Same precision (bf16), `triton.testing.do_bench` (min latency, L2-flush) on GPU 0 — the harness GPU,
-matching `run_gist.sh`'s `min_ms` (the CUDA kernel measures 3.40 ms there too):
+## Results (single H100, B=1536 F=1497 D=192 Q=128, bf16)
+
+Latency via `triton.testing.do_bench` (min, L2-flush) on GPU 0 — the `cuda_exec` harness GPU/statistic
+(`run_gist.sh`'s `min_ms`):
 
 | method (bf16) | latency |
 |---|---|
 | PyTorch eager | 12.6 ms |
 | PyTorch `compile` | 4.26 ms |
 | Triton-fast (`gist_triton_fast_forward`) | 4.19 ms |
-| **CUDA (`cuda/gist.cu`)** | **3.42 ms** |
+| **CUDA + inline PTX (hand-written)** | **2.64 ms** |
 
-The **CUDA kernel (`cuda/gist.cu`) is the fastest — ~18 % faster than Triton-fast**, ~20 % vs
-`torch.compile`. The lever is the gate GEMM: Triton's `tl.dot` gate reaches only ~37 % of the tensor pipe
-(≈2.6 ms), and `compile` burns ~1.85 ms in memory-bound glue (transpose P, materialize N, sigmoid); the
-CUDA kernel avoids both — a **cuBLAS gate at ≈1.18 ms** (a hand-written inline-PTX WGMMA gate reaches the
-same ~1.2 ms, kept env-gated) plus a CUTLASS pool and hand-written stats / sigmoid-pad passes.
+The hand-written **CUDA+PTX kernel is the fastest — ~37 % faster than Triton-fast** (correct: max_abs
+0.0156, 0/1536 vs the RMSNorm reference). It's **three fused hand-written kernels**, each pinned to a
+different ceiling on this (throttled) box (~2.07 TB/s HBM, ~800 TFLOP/s bf16 tensor):
 
-Per-kernel ms — Triton: gate 2.64 · pool 1.19 · stats 0.41.  CUDA: gate ≈1.18 · pool ≈0.79 · sigpad ≈0.56
-· stats ≈0.86. (This box runs ~2.07 TB/s HBM and ~807 TFLOP/s bf16 tensor, both below datasheet, so the
-gate at ~700 TFLOP/s is already near its compute ceiling here.)
+| kernel | time | bound | util |
+|---|---|---|---|
+| **stats** — `M`, `rrms` (int4-vectorized D-reduction) | 0.43 ms | memory | 92% HBM |
+| **gate** — `σ(M@P)` WGMMA, σ + F→Fp pad **fused into the epilogue** (writes padded `SL` directly) | 1.37 ms | tensor | 84% of 800 TF |
+| **pool** — `SL@N` WGMMA, RMSNorm `N = X·rrms·W` computed **inline** (no materialized `N`) | 0.79 ms | memory | 87% HBM |
 
-**Correctness:** validated against an fp32 reference with `init_unit_scale_` (so `O ~ O(1)` and
-tolerances are meaningful). `test_gist.py` passes all 20 checks (5 seeds × {bf16,tf32} ×
-{design shape, masking edge case}): bf16 rel-Frobenius ~4.1e-3, tf32 ~8.2e-4, each vs both the
-fp32 truth and the same-precision PyTorch reference; `cuda/gist.cu` passes the `cuda_exec` harness
-(max_abs 0.0156, 0/1536 batches). Run `bench.py` / `test_gist.py` on a CUDA box.
+Two fusions are the win: the gate writes padded `SL` directly (deletes the separate ~0.78 ms repad pass),
+and the pool computes `N` inline (deletes the ~0.9 GB `N` round-trip). Triton instead pays a slow `tl.dot`
+gate (~2.6 ms); `compile` pays ~1.85 ms of memory-bound glue.
 
-## Why no online (single-pass) form
+> **Caveat (weight prepack):** the gate uses a one-time prepacked padded `P` — valid because the weights
+> are static (the harness holds `P`, `W` constant). Triton's per-call path prepacks nothing, so the ~37 %
+> is a production-mode (prepacked-weights) comparison. Repro:
+> `GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 ./run_gist.sh <rev> big`
+> (kernel snapshot: `GEMS/2026-06-09-gist-b-phase4-gate-padded-norepad/`).
 
-Unlike FlashAttention's softmax — whose reduction is over the *streamed* axis and
-is rescalable — GIST's gate contracts the **full** per-feature mean `M`, so `M`
-must be complete before any output. Clean structure is therefore **two grids**: a
-cheap stats grid lands `M, rrms : [B,F]` to HBM, then the main grid fuses
-gate × pool reading them back. Only the tiny `M, rrms` cross HBM between grids; the
-big `L` (~0.6 GB) and `N` (~0.9 GB) never do. `X` is read twice (stats, then
-RMSNorm), which is still cheaper than materializing `N`.
+**Correctness:** the kernel passes the `cuda_exec` harness (max_abs 0.0156, 0/1536). The Triton path passes
+`test_gist.py` (20 checks: 5 seeds × {bf16,tf32} × {design shape, masking edge}), bf16 rel-Frobenius
+~4.1e-3 vs both fp32 truth and the same-precision PyTorch reference.
 
-`gist_triton.py` (v1) is the main (Grid 2) fusion with `M, rrms` precomputed —
-correctness-first, per-batch GEMV gate (no tensor cores), so slow. `gist_triton_fast.py`
-is the optimized path: a separate batch-tiled tensor-core gate GEMM (so each streamed `P`
-tile is reused across `BLOCK_M >= 16` rows of `M`) materializes `L` (cheap, ~0.3 ms), then
-a fused pool/RMSNorm kernel consumes it. Materializing `L` is far cheaper than the gate
-compute, so the two-kernel split wins over a single fused kernel (whose tensor-core gate
-would force a 3D pool accumulator that wrecks occupancy).
+## Why two grids (no single-pass form)
 
-## Status & next steps
-
-**Status:** forward-only; **done and validated on H100**. Fastest is the **CUDA kernel**
-(`cuda/gist.cu`) at **3.42 ms — ~18 % faster than Triton-fast (4.19 ms)** via a fast tensor-core gate
-(cuBLAS, ≈1.18 ms) replacing Triton's slow `tl.dot` gate. See Results above; v1 (`gist_triton.py`)
-kept for reference.
-
-Environment: `.venv` (uv-managed CPython, not Meta python) with torch 2.12 + triton 3.7.
-Run `.venv/bin/python bench.py` (pin an idle GPU with `CUDA_VISIBLE_DEVICES`).
-
-Possible further work:
-1. **bf16 gate** dominates the cost; the whole kernel runs at ~227 TFLOP/s total on this
-   small-M/huge-N shape — a plain batch-tiled GEMM is near its floor here. A Hopper TMA +
-   warp-specialized / persistent gate could push higher.
-2. **tf32 variant** loses to `compile`-tf32: cuBLAS's tf32 GEMM is strong and inductor
-   overlaps the pool. Beating it needs a single fully-fused kernel (hard: the batch-tiled
-   tensor-core gate forces a 3D pool accumulator) — not done.
-3. Backward pass; smaller-batch / variable-F regimes.
+Unlike FlashAttention's softmax (reduction over the *streamed* axis, rescalable), GIST's gate contracts
+the **full** per-feature mean `M`, so `M` must be complete before any output. Hence two grids: a cheap
+`stats` grid lands `M, rrms` to HBM; then `gate → pool` reads them back. The big `L` and `N` never fully
+cross HBM — the gate writes padded `SL` directly, and the pool recomputes `N` inline. `X` is read twice
+(stats, then pool), still cheaper than materializing `N`.
 
 ## Design note
 
