@@ -19,6 +19,8 @@ gist_triton.py avoids them.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -53,6 +55,26 @@ class RMSNorm(nn.Module):
         if self.weight is not None:
             n = n * self.weight                                          # [F, D] bcast over B
         return n
+
+
+def init_unit_scale_(gist: "GIST") -> "GIST":
+    """Initialize a GIST (in place) so its forward output is ~O(1), for tests/benchmarks.
+
+    The pool O = bmm(L, N) sums over F features, so without scaling O grows ~sqrt(F).
+    Keeping O ~ O(1) makes tolerances meaningful and lets low precision (bf16) be
+    testable. This is fan-in scaling over the pooled axis F — it does NOT change the
+    GIST formula, only the init magnitudes. Pair it with X ~ N(0, 1).
+
+      P ~ N(0, 1)            gate logits std ~ sqrt(F)*std(M) ~ a few -> gates span (0,1)
+      W ~ N(0, 1/sqrt(F))    RMSNorm weight [F, D]; tames the sqrt(F) pool variance term
+                             (RMSNorm has no bias, so there is no F-scaled offset term)
+    """
+    F = gist.F
+    with torch.no_grad():
+        nn.init.normal_(gist.proj.weight, 0.0, 1.0)
+        if gist.norm.weight is not None:
+            nn.init.normal_(gist.norm.weight, 0.0, 1.0 / math.sqrt(F))
+    return gist
 
 
 class GIST(nn.Module):

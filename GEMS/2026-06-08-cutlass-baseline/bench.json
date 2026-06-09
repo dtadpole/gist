@@ -1,0 +1,51 @@
+cuda_exec from: /home/zhenc/kernel_lab/.worktrees/gist/cuda_exec/__init__.py
+=== compile (rev 9106) ===
+compile keys: ['metadata', 'all_ok', 'kind', 'attempt', 'command', 'turn_root', 'workspace_path', 'returncode', 'duration_seconds', 'artifacts', 'output', 'files', 'configs']
+compile all_ok: True None
+binary: /home/zhenc/.cuda_exec/run_h8_3_gist/v1/0_gist/rev_9106/artifacts/compile.attempt_001.generated.bin exists: True
+=== trial ===
+{
+  "metadata": {
+    "run_tag": "run_h8_3_gist",
+    "version": "v1",
+    "direction_id": 0,
+    "direction_slug": "gist",
+    "revision": 9106
+  },
+  "all_ok": true,
+  "kind": "trial",
+  "attempt": 1,
+  "command": [
+    "/home/zhenc/.cuda_exec/run_h8_3_gist/v1/0_gist/rev_9106/artifacts/compile.attempt_001.generated.bin"
+  ],
+  "turn_root": "/home/zhenc/.cuda_exec/run_h8_3_gist/v1/0_gist/rev_9106",
+  "workspace_path": "/home/zhenc/.cuda_exec/run_h8_3_gist/v1/0_gist/rev_9106/workspace",
+  "returncode": 0,
+  "duration_seconds": 7.081794550991617,
+  "artifacts": [
+    {
+      "artifact_id": "trial:comparison:gist-big",
+      "kind": "comparison",
+      "path": "artifacts/trial.attempt_001.config_gist-big.comparison.json",
+      "description": "Reference/generated comparison payload for config gist-big"
+    },
+    {
+      "artifact_id": "trial:state",
+      "kind": "state",
+      "path": "state/trial.attempt_001.json",
+      "description": "Trial manifest for this revision and attempt"
+    }
+  ],
+  "output": {
+    "stdout": "=== config gist-big stdout ===\n{\n  \"metadata\": {\n    \"run_tag\": \"run_h8_3_gist\",\n    \"version\": \"v1\",\n    \"direction_id\": 0,\n    \"direction_slug\": \"gist\",\n    \"revision\": 9106\n  },\n  \"config_slug\": \"gist-big\",\n  \"status\": \"ok\",\n  \"golden_slug\": \"ref-pytorch\",\n  \"impls\": {\n    \"gen-cuda\": {\n      \"performance\": {\n        \"metadata\": {\n          \"rank\": 3,\n          \"shape_kind\": \"3d\",\n          \"input_size\": 37748736,\n          \"shape\": [\n            1536,\n            128,\n            192\n          ]\n        },\n        \"latency_ms\": {\n          \"min\": 4.37472,\n          \"p10\": 4.384608,\n          \"p25\": 4.397696,\n          \"p50\": 4.437152,\n          \"p75\": 4.447104,\n          \"p90\": 4.458336,\n          \"max\": 4.45936,\n          \"mean\": 4.424287\n        },\n        \"raw_latencies_ms\": [\n          4.45936,\n          4.432064,\n          4.437152,\n          4.454784,\n          4.442592,\n          4.441952,\n          4.436352,\n          4.447104,\n          4.458336,\n          4.459328,\n          4.456576,\n          4.440448,\n          4.44672,\n          4.408416,\n          4.384608,\n          4.398016,\n          4.37472,\n          4.377472,\n          4.390112,\n          4.385184,\n          4.405312,\n          4.397696\n        ],\n        \"runs\": 22\n      },\n      \"correctness\": {\n        \"passed\": true,\n        \"max_abs_error\": 0.03125,\n        \"mean_abs_error\": 3.1543540899292566e-06\n      }\n    },\n    \"ref-pytorch\": {\n      \"performance\": {\n        \"metadata\": {\n          \"hardware\": \"NVIDIA H100\",\n          \"device\": \"cuda\"\n        },\n        \"latency_ms\": {\n          \"min\": 21.77459144592285,\n          \"p10\": 21.77459144592285,\n          \"p25\": 21.85103988647461,\n          \"p50\": 21.852399826049805,\n          \"p75\": 21.857311248779297,\n          \"p90\": 21.857311248779297,\n          \"max\": 21.857311248779297,\n          \"mean\": 21.83417558670044,\n          \"std\": 0.03980566694602149\n        },\n        \"runs\": 4\n      },\n      \"correctness\": null\n    }\n  }\n}\n",
+    "stderr": "=== config gist-big stderr ===\n[03:21:48] discovered 2 impls, golden=ref-pytorch\n[03:21:48] gen-cuda start (cu)\n[03:21:52] gen-cuda done (4.1s)\n[03:21:52] ref-pytorch start (py)\n[03:21:52] ref-pytorch done (0.8s)\n"
+  },
+  "files": [
+    {
+      "path": "/home/zhenc/.cuda_exec/run_h8_3_gist/v1/0_gist/rev_9106/state/configs/trial.attempt_001.config_gist-big.json",
+      "name": "trial.attempt_001.config_gist-big.json",
+      "exists": true,
+      "size_bytes": 856,
+      "encoding": "utf8",
+      "truncated": false,
+      "content": "{\n  \"config\": {\n    \"slug\": \"gist-big\",\n    \"params\": {\n      \"family\": \"gist\",\n      \"shape\": [\n        1536,\n        128,\n        192\n      ],\n      \"rank\": 3,\n      \"shape_kind\

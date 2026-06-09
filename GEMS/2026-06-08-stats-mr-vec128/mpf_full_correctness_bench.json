@@ -1,0 +1,83 @@
+{
+  "metadata": {
+    "run_tag": "run_h8_3_gist",
+    "version": "v1",
+    "direction_id": 0,
+    "direction_slug": "gist",
+    "revision": 50014
+  },
+  "config_slug": "gist-big",
+  "status": "ok",
+  "golden_slug": "ref-pytorch",
+  "impls": {
+    "gen-cuda": {
+      "performance": {
+        "metadata": {
+          "rank": 3,
+          "shape_kind": "3d",
+          "input_size": 37748736,
+          "shape": [
+            1536,
+            128,
+            192
+          ]
+        },
+        "latency_ms": {
+          "min": 6.109312,
+          "p10": 6.110208,
+          "p25": 6.112576,
+          "p50": 6.115232,
+          "p75": 6.15024,
+          "p90": 6.199296,
+          "max": 6.202848,
+          "mean": 6.132106
+        },
+        "raw_latencies_ms": [
+          6.199296,
+          6.202848,
+          6.198528,
+          6.15024,
+          6.11376,
+          6.114592,
+          6.111104,
+          6.109312,
+          6.11456,
+          6.110208,
+          6.116352,
+          6.112576,
+          6.115712,
+          6.111776,
+          6.1176,
+          6.115232
+        ],
+        "runs": 16
+      },
+      "correctness": {
+        "passed": true,
+        "max_abs_error": 0.03125,
+        "mean_abs_error": 0.0004571561876218766
+      }
+    },
+    "ref-pytorch": {
+      "performance": {
+        "metadata": {
+          "hardware": "NVIDIA H100",
+          "device": "cuda"
+        },
+        "latency_ms": {
+          "min": 21.804319381713867,
+          "p10": 21.804319381713867,
+          "p25": 21.810848236083984,
+          "p50": 21.82371234893799,
+          "p75": 21.931135177612305,
+          "p90": 21.931135177612305,
+          "max": 21.931135177612305,
+          "mean": 21.845719814300537,
+          "std": 0.05862140669997983
+        },
+        "runs": 4
+      },
+      "correctness": null
+    }
+  }
+}

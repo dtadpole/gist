@@ -37,11 +37,34 @@ Design defaults (large-scale target): `B=1536, F=1497, D=192, Q=128`.
 
 | File | What |
 |---|---|
-| `gist_pytorch.py` | Readable reference forward (`class GIST(nn.Module)`). Materializes the big intermediates `L [B,Q,F]` and `N [B,F,D]`. |
-| `gist_triton.py`  | Fused Triton forward (`gist_triton_forward`). Computes the gate tile-by-tile on-chip and recomputes RMSNorm on the fly, so `L` and `N` never touch HBM — only `X`, `P` are read and `O` is written. |
+| `gist_pytorch.py` | Readable reference forward (`class GIST(nn.Module)`) + `init_unit_scale_` (fan-in init so `O ~ O(1)`). |
+| `gist_triton.py`  | v1 correctness-first fused forward (`gist_triton_forward`): single kernel, per-batch GEMV gate. Correct but ~25× slower than the fast path — kept for reference. |
+| `gist_triton_fast.py` | **Fast** forward (`gist_triton_fast_forward`, `precision="bf16"`/`"tf32"`): three autotuned kernels — stats (`M,rrms`) → gate GEMM (`L=sigmoid(M@P)`, batch-tiled tensor-core, L2-grouped) → fused pool/RMSNorm. |
+| `bench.py` | Benchmark vs PyTorch eager / `torch.compile` across fp32/tf32/bf16: latency, speedup, achieved TFLOP/s, rel & abs error. |
+| `test_gist.py` | Hardened correctness test: 5 seeds × {bf16,tf32} × {design shape, masking edge case}, asserts rel-Frobenius vs fp32 truth **and** vs same-precision PyTorch. |
 
-The two agree to `< 1e-3` max abs error (see each file's `__main__` self-test; the
-Triton test needs a CUDA box).
+## Results (single H100, B=1536 F=1497 D=192 Q=128, ~994 GFLOP/call)
+
+Same-precision comparison (speedup vs eager **of the same dtype**; error vs fp32 truth).
+Measured with RMSNorm values (`bench.py`, median of 20 iters):
+
+| method (bf16) | latency | speedup vs eager-bf16 | rel-err |
+|---|---|---|---|
+| PyTorch eager | 12.62 ms | 1.00× | 4.8e-3 |
+| PyTorch `compile` | 4.38 ms | 2.89× | 4.1e-3 |
+| **Triton-fast** | **4.40 ms** | **2.87×** | 4.1e-3 |
+
+The bf16 fast kernel **ties `torch.compile`** at the same precision (~4.4 ms, ~227 TFLOP/s
+total; the two are within run-to-run noise). The gate GEMM dominates the cost (~0.88 of the
+~0.99 TFLOP). With LayerNorm (the earlier reference, F=1491) the kernel was ~10% ahead of
+`compile`; under the cheaper RMSNorm value path `compile`'s fused inductor kernel closes that
+gap. The tf32 variant (12.8 ms) loses to `compile`-tf32 (7.9 ms): cuBLAS's tf32 GEMM inside
+`compile` is hard to beat with a multi-kernel Triton design.
+
+**Correctness:** validated against an fp32 reference with `init_unit_scale_` (so `O ~ O(1)` and
+tolerances are meaningful). `test_gist.py` passes all 20 checks (5 seeds × {bf16,tf32} ×
+{design shape, masking edge case}): bf16 rel-Frobenius ~4.1e-3, tf32 ~8.2e-4, each vs both the
+fp32 truth and the same-precision PyTorch reference. Run `bench.py` / `test_gist.py` on a CUDA box.
 
 ## Why no online (single-pass) form
 
@@ -53,31 +76,31 @@ gate × pool reading them back. Only the tiny `M, rrms` cross HBM between grids;
 big `L` (~0.6 GB) and `N` (~0.9 GB) never do. `X` is read twice (stats, then
 RMSNorm), which is still cheaper than materializing `N`.
 
-The Triton kernel here is the main (Grid 2) fusion with `M, rrms` precomputed; it
-is **correctness-first, not speed-optimal** (no tensor cores on the gate yet). The
-fast path tiles a batch block so the gate becomes a tensor-core GEMM that reuses
-each streamed `P` tile — see the design note.
+`gist_triton.py` (v1) is the main (Grid 2) fusion with `M, rrms` precomputed —
+correctness-first, per-batch GEMV gate (no tensor cores), so slow. `gist_triton_fast.py`
+is the optimized path: a separate batch-tiled tensor-core gate GEMM (so each streamed `P`
+tile is reused across `BLOCK_M >= 16` rows of `M`) materializes `L` (cheap, ~0.3 ms), then
+a fused pool/RMSNorm kernel consumes it. Materializing `L` is far cheaper than the gate
+compute, so the two-kernel split wins over a single fused kernel (whose tensor-core gate
+would force a 3D pool accumulator that wrecks occupancy).
 
 ## Status & next steps
 
-**Status:** forward-only; correctness-first. Written on a machine with no GPU and
-no `torch`, so **nothing here has been run yet** — the self-tests are unexecuted.
+**Status:** forward-only; **done and validated on H100**. The fast bf16 kernel ties
+`torch.compile` at matching precision (~4.4 ms) — see Results above. Three autotuned
+kernels (stats → gate GEMM → fused pool); v1 kept for reference.
 
-To continue on a GPU box (in order):
+Environment: `.venv` (uv-managed CPython, not Meta python) with torch 2.12 + triton 3.7.
+Run `.venv/bin/python bench.py` (pin an idle GPU with `CUDA_VISIBLE_DEVICES`).
 
-1. **CPU reference** — `python gist_pytorch.py` (needs `torch`). Confirms shapes
-   and the reference math.
-2. **Triton vs reference** — `python gist_triton.py` on CUDA. Confirms the fused
-   kernel matches to `< 1e-3`. The self-test uses `F=80` (not a multiple of
-   `BLOCK_G`) on purpose, to exercise the padded-`g` masking path.
-3. **Optimize the gate (the real work).** The current gate is a per-batch GEMV via
-   `tl.sum` with the `P` sub-tile register-resident — correct but slow (no tensor
-   cores). Make both stages `tl.dot` GEMMs and **tile a batch block** (`BLOCK_B >=
-   16` rows of `M`) so the gate becomes a tensor-core GEMM `M[BLOCK_B,F] @ P` that
-   reuses each streamed `P` tile across the batch. `P` (~0.6 GB, shared across all
-   `B`) is the dominant HBM traffic, so batch reuse is the main win. Optionally
-   split into the explicit two-grid form (cheap stats grid lands `M, rrms`, main
-   grid fuses gate × pool) — see Obsidian §4.
+Possible further work:
+1. **bf16 gate** dominates the cost; the whole kernel runs at ~227 TFLOP/s total on this
+   small-M/huge-N shape — a plain batch-tiled GEMM is near its floor here. A Hopper TMA +
+   warp-specialized / persistent gate could push higher.
+2. **tf32 variant** loses to `compile`-tf32: cuBLAS's tf32 GEMM is strong and inductor
+   overlaps the pool. Beating it needs a single fully-fused kernel (hard: the batch-tiled
+   tensor-core gate forces a 3D pool accumulator) — not done.
+3. Backward pass; smaller-batch / variable-F regimes.
 
 ## Design note
 
