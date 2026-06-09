@@ -34,29 +34,28 @@ shape_mode = sys.argv[2] if len(sys.argv) > 2 else "small"
 
 # small = quick correctness; big = design shape (matches the Triton benchmark)
 if shape_mode == "big":
-    B, F, D, Q = 1536, 1491, 192, 128
+    B, F, D, Q = 1536, 1497, 192, 128
 else:
     B, F, D, Q = 8, 320, 192, 64
 QF = Q * F
-X_n, P_n, O_n = B * F * D, F * QF, B * Q * D
-buf = max(X_n, P_n, O_n)
+X_n, P_n, W_n, O_n = B * F * D, F * QF, F * D, B * Q * D
+buf = max(X_n, P_n, W_n, O_n)
 
 import math
-# unit-scale init (match gist_pytorch.init_unit_scale_): X,P ~ N(0,1); gamma ~ N(0,1/sqrt(F));
-# beta ~ N(0,1/F) -> O ~ O(1), gates span (0,1). Harness fills uniform[-0.5,0.5) (std 1/sqrt(12)),
-# so per-input scale = target_std / uniform_std makes the bf16 kernel testable at allclose(1e-2).
+# RMSNorm spec (gist_pytorch.init_unit_scale_): X,P ~ N(0,1); W ~ N(0,1/sqrt(F)) (RMSNorm weight,
+# no bias) -> O ~ O(1), gates span (0,1). Harness fills uniform[-0.5,0.5) (std 1/sqrt(12)), so
+# per-input scale = target_std / uniform_std makes the bf16 kernel testable at allclose(1e-2).
 _su = (1.0 / 12.0) ** 0.5
 config = {
     "family": "gist",
     "shape": [B, Q, D], "rank": 3, "shape_kind": "3d", "input_size": O_n,
-    "input_shapes": [[B, F, D], [F, QF], [D], [D]],
-    "harness_num_inputs": 4, "harness_num_outputs": 1,
+    "input_shapes": [[B, F, D], [F, QF], [F, D]],
+    "harness_num_inputs": 3, "harness_num_outputs": 1,
     "harness_buf_size": buf, "harness_output_size": O_n,
     "gist_b": B, "gist_f": F, "gist_d": D, "gist_q": Q,
     "harness_scale_0": 1.0 / _su,                       # X ~ N(0,1)
     "harness_scale_1": 1.0 / _su,                       # P ~ N(0,1)
-    "harness_scale_2": (1.0 / math.sqrt(F)) / _su,      # gamma ~ N(0,1/sqrt(F))
-    "harness_scale_3": (1.0 / F) / _su,                 # beta ~ N(0,1/F)
+    "harness_scale_2": (1.0 / math.sqrt(F)) / _su,      # W ~ N(0,1/sqrt(F))  (RMSNorm weight)
 }
 
 md = Metadata(run_tag="run_h8_3_gist", version="v1", direction_id=0,

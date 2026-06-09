@@ -74,6 +74,30 @@ tolerances are meaningful). `test_gist.py` passes all 20 checks (5 seeds × {bf1
 {design shape, masking edge case}): bf16 rel-Frobenius ~4.1e-3, tf32 ~8.2e-4, each vs both the
 fp32 truth and the same-precision PyTorch reference. Run `bench.py` / `test_gist.py` on a CUDA box.
 
+## CUDA + PTX kernel (hand-written — fastest)
+
+A hand-written **CUDA + inline-PTX (Hopper WGMMA)** forward kernel (`cuda/gist.cu`, run via the
+`cuda_exec` harness) is the fastest implementation of this module. Measured on the design shape
+(B=1536, F=1497, D=192, Q=128), bf16, L2-flushed:
+
+| implementation (bf16, design shape) | latency | vs Triton-fast |
+|---|---|---|
+| **CUDA + PTX (`cuda/gist.cu`)** | **3.49 ms** | **~16 % faster** |
+| Triton-fast (`gist_triton_fast_forward`) | 4.15 ms | — |
+
+Our kernel: **3.4939 ms** (harness, correctness PASS, `max_abs 0.0156`, 0/1536 batches in error)
+vs the Triton-fast `do_bench` bar **4.1519 ms** → **~16 % faster**. Per-stage (ms):
+`stats` (M, rrms, materialize N=X·rrms·W) ≈ 0.86 · WGMMA gate (`L=σ(M@P)`) ≈ 1.25 ·
+vectorized sigmoid+pad ≈ 0.56 · WGMMA pool (`O=SL@N`) ≈ 0.79. We beat Triton on **both** GEMMs
+(gate and pool); the residual gap vs an ideal is the helper passes (the N-write + repad) that
+Triton fuses into its pool — a hand-fused pool was measured to be a net loss here (the software
+operand-relayout costs more than CUTLASS's hardware TMA relayout).
+
+**Hardware note:** this H100 box is throttled below datasheet — *measured* peaks are **~2.07 TB/s**
+HBM (vs 3.35) and **~807 TFLOP/s** bf16 tensor (vs 989). The gate runs at ~700 TFLOP/s ≈ **88 % of
+the real tensor peak** (near its compute ceiling); the helper passes sit at the HBM-bandwidth wall.
+So the per-call latencies above are bandwidth/compute-limited by this specific box, not the datasheet.
+
 ## Why no online (single-pass) form
 
 Unlike FlashAttention's softmax — whose reduction is over the *streamed* axis and

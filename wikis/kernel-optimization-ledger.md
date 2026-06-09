@@ -8,8 +8,30 @@ FORMAT:
   - EVIDENCE: real measured numbers / NCU counters (never invented)
   - IMPLICATION: what other branches should do/avoid
 
-Target <2.95ms / min acceptable <3.38ms / audited fallback floor ~4.017ms.
-Global best (see GEMS): 2026-06-08 gate-fused-sigmoid = 4.014ms (beats Triton 4.225 by 5.0%).
+**Triton bar (measured, apples-to-apples, do_bench L2-flush, design shape, bf16):**
+- NEW spec (RMSNorm, F=1497): **~4.15 ms** (4.1519 median/28 runs; 4.1857 quick-check `/tmp/bench_triton_rms.py`, 2026-06-09).
+- OLD spec (LayerNorm, F=1491): 4.185 ms do_bench / 4.225 ms harness. (≈ unchanged: RMSNorm is cheaper but F is bigger.)
+
+Targets vs the new bar: **30% goal = <2.91 ms ; 20% min-acceptable = <3.32 ms.** Audited fallback floor ~4.01 ms.
+
+**Current best — NEW spec (RMSNorm/F=1497), MEASURED 2026-06-09:**
+- **3.4939 ms** (harness, passed, max_abs 0.0156, 0/1536) = **~16% faster than the 4.15 ms Triton bar.**
+  Migrated from the 3.465 LayerNorm gem (gate-NOSIG + vectorized sigpad); same latency since RMSNorm has the
+  same memory footprint (only drops the −m·m term + uses W[f,d]). Still SHORT of the 20% bar (3.32).
+- Per-stage (≈, from the LayerNorm gem; structure unchanged): stats(M,R,N)≈0.86 · gate≈1.25 · sigpad≈0.56 · pool≈0.79.
+
+**Prior best (OLD LayerNorm/F=1491, for the record):** 3.465 ms (C gate-NOSIG + vecsigpad, GEM) ;
+3.670 ms (B hand-written CUDA+PTX WGMMA gate at CUTLASS parity, 1.255 ms gate, persistent + TMA-store epilogue).
+
+**Hardware reality (THIS box, MEASURED — both throttled well below datasheet):**
+- HBM bandwidth: **~2.07 TB/s mixed (2.29 read)**, NOT 3.35 TB/s datasheet (`/tmp/bwtest.cu` int4 copy).
+- bf16 tensor peak: **~807 TFLOP/s** (cuBLAS 8192³), NOT 989 datasheet. Gate runs at ~700 TF = ~88% of this real peak → near its compute ceiling.
+
+**Convergent verdicts (all measured, multi-branch):** the win is NOT in the GEMMs (we already beat Triton on
+both gate and pool) — it's the helpers (stats N-write + repad) that Triton fuses away. But the hand fused pool
+is a software-relayout DEAD-END (~2.7 ms, SM-issue-bound; CUTLASS does the relayout in hardware via TMA at
+0.79 ms). The genuine "ptxas warp-3 acc[32] bug" was a missing `fence.proxy.async.shared::cta` (SOLVED). The
+gate is at the throttled compute ceiling; gate-mainloop occupancy (PINGPONG/stages/cluster) is exhausted.
 
 ---
 
@@ -170,3 +192,72 @@ Global best (see GEMS): 2026-06-08 gate-fused-sigmoid = 4.014ms (beats Triton 4.
     pipe that regresses). + the earlier epilogue lever (staged uint4 → SM 47→72%) + m64n256 + bank-pad +
     proxy-fence-drop. Non-persistent best was 1.34–1.36; persistent overlap closed the last ~6%. CUTLASS uses
     the same SM90_TMA_STORE + ClusterShape<1,1,1> (no cluster). Phase 2 (sigmoid+SL-pad fusion) next.
+
+- **[2026-06-08T22:30Z] FINDING (independent) — B** (Phase-2 padded-fused gate: correct but the PADDING is fundamentally slow)
+  - WHAT: fused sigmoid + padded-SL[B,QFp] write into the gate epilogue (remove k_sigpad). CORRECT (flat-N
+    reads P fresh, scatter to padded SL, max_abs 0.03125) but SLOW: scalar-scatter 4.62ms total, coalesced-
+    chunked 5.76ms, fused-gate iso ~4.1ms (vs Phase-1 gate 1.26 + sigpad 0.56 = 1.82). Independently confirms
+    branch C's "padded-fused is the enemy" via 3 of my own impls.
+  - EVIDENCE: revs 80260 (scalar 4.62), 80270/80271 (coalesced 5.76 / gate 4.1). Root cause: Phase-1's gate is
+    fast ONLY because its epilogue uses an ASYNC TMA store (overlaps next-tile mainloop), which needs 64B align.
+    The padded SL col q*Fp+f: q*Fp is 64-aligned (Fp=1536=24*64) but f is arbitrary (F=1491 odd) => a flat-N
+    tile's output is misaligned => no async TMA store => synchronous scatter => tensor pipe idles in the epilogue.
+  - ROOT CAUSE of the earlier crash/garbage attempts: per-q tiling (aligned SL TMA store, FAST) needs per-q P
+    columns at q*F (NOT %64 -> SWIZZLE_128B illegal-instruction; a 3D map's q-stride F*2 is NOT %16 ->
+    cuTensorMapEncodeTiled INVALID). So per-q needs a per-q-PADDED P copy (Pp[F,QFp]) -- but the harness re-fills
+    P IN PLACE (same ptr), so a pointer-cached Pp goes STALE (verified: GIST_REPAD_EVERY -> PASS). P is static in
+    production (Pp = one-time prepack) but the benchmark can't represent that.
+  - IMPLICATION: the SIGMOID fuses for free (into Phase-1's flat-L epilogue); the PADDING is the cost. Fast
+    padded-fused needs EITHER per-q + Pp prepack (production-valid; benchmark needs a Pp refresh, hideable under
+    stats) OR an unpadded-flat-L pool (C's ~3.2ms route, needs the pool to read odd-F K directly). v17/Phase-1
+    (gate 1.26 parity) + sigpad (3.67ms total) remains the verified best end-to-end.
+
+- **[2026-06-08T23:40Z] FINDING (independent, definitive) — B** (fusing the PADDED output is counterproductive; separation wins)
+  - WHAT: exhaustively tested Phase-2 fused (σ + padded SL, no repad), 5 impls, all CORRECT (max_abs 0.03125)
+    but ALL slower than Phase-1 (flat gate 1.26 + separate sigpad 0.56 = 1.82eq, total 3.67):
+    flat-N scalar scatter (gate ~2.9), flat-N coalesced chunk (~4.1), per-q async-TMA+σ (gate 2.50, tensor 51%),
+    producer-σ-overlap flat-N (gate 3.63, tensor 24%, long_scoreboard 7.89 from single-buf serialization).
+  - EVIDENCE: NCU debunks the L2-thrash theory (L2 hit 87-90% in ALL variants, lg_throttle ~0). The real cost is
+    the padded-SL WRITE in the gate epilogue: it's either misaligned (odd F=1491 -> can't use the fast async TMA
+    store -> slow scatter) or, when on the producer, serializes via the single-buffer staging (double-buffer = 128KB
+    + ring > 227KB smem). The SIGMOID fuses for free (applied in staging); the PADDING is the cost.
+  - WHY separation wins: Phase-1's sigpad is a CLEAN memory-bound pass (0.56ms, 1.2GB) that does NOT contend with
+    the gate's tensor pipe. Fusing the padded write into the gate forces a slow/serial epilogue that idles/stalls
+    the gate's tensor pipe (78% -> 24-51%), costing MORE than the separate sigpad.
+  - IMPLICATION: the genuinely-fast fused needs the FULL CUTLASS recipe = per-q tiling (aligned async TMA store) +
+    producer-σ-overlap + per-q-PREPACKED P (Pp, [F,QFp]). Pp is a one-time static weight prepack (production-valid;
+    CUTLASS prepacks weights) but the harness re-fills P in place so it needs a Pp refresh (hideable under stats).
+    Without the prepack model, Phase-1 (3.67ms, gate parity 1.26 + sigpad) is the best end-to-end and stands.
+
+- **[2026-06-09T01:00Z] FINDING (definitive, ~12 variants) — B** (Phase-2 fused-padded gate is a net regression vs Phase-1 for odd-F; σ is NOT the cost)
+  - WHAT: exhaustively built+NCU'd ~12 fused variants (σ + padded SL, no repad), ALL correct (max_abs 0.03125)
+    but ALL net regressions vs Phase-1 (flat gate 1.26 + sigpad 0.56 = 1.82eq, total 3.67):
+    best = per-q σ-in-consumer 2.50ms gate; producer-σ-overlap (single/double/chunked buf, wait<0> AND wait<1>)
+    all WORSE 3.2-3.4ms gate. σ floor is only 0.14ms (SFU-bound; →0.07 w/ h2exp2) -- σ is NOT the bottleneck.
+  - EVIDENCE: NCU best fused (per-q σ-in-consumer) tensor 51% vs Phase-1 flat 78%; producer-σ variants tensor
+    26-28%, long_scoreboard 9.9-11.2 (the consumer's epilogue staging+handoff stalls the mainloop ring; wait<1>
+    store-pipelining did NOT fix it -> 3.36). The producer-σ handoff (ep mbarriers + bar.sync 2,96) costs MORE
+    (+0.9ms) than just doing σ serially in the consumer. S=5 ring alone = 240KB > 227KB smem, so the deepest
+    ring + double-buffered overlap epilogue cannot coexist.
+  - ROOT: the padded per-q epilogue (staging + chunked async store) idles the tensor pipe ~1ms regardless of σ;
+    Phase-1's sigpad is instead a CLEAN memory-bound pass (0.56ms) that doesn't contend with the gate's tensor
+    pipe. So SEPARATION beats FUSION for odd-F=1491. The sigmoid fuses ~free; the PADDING is the irreducible cost.
+  - IMPLICATION: keep Phase-1 (gate parity 1.26 + sigpad, 3.67ms, locked GEM) as production. A net-win fused needs
+    either an unpadded-flat-L pool (pool reads odd-F K directly, no padding) or a fundamentally different epilogue
+    that overlaps the padded store without a producer handoff -- neither cracked in 12 attempts.
+
+- **[2026-06-09T02:45Z] MEASUREMENT — MAIN** (*** SPEC CHANGED: LayerNorm → RMSNorm, F 1491 → 1497 ***)
+  - WHAT: GIST spec changed (another session, owner-confirmed). Value norm is now RMSNorm:
+    N = X·rsqrt(mean_D(X²)+eps)·W[F,D] — NO mean-subtraction, NO bias; weight is per-(feature,channel)
+    W[F,D] (was γ[D]+β[D]); inputs 4→3 (X,P,W). M=mean (gate), gate=sigmoid(M@P), pool=L@N UNCHANGED.
+    Stats R = rrms = rsqrt(s2/D+eps) (drop −m·m). Shape F=1497 (was 1491; Fp still 1536).
+  - EVIDENCE: re-baselined the oracle+drivers (gist_ref.py, driver.py, debug_isolate.py → RMSNorm/F=1497/
+    3-inputs; worktree harness is generic so no infra change). Migrated gist.cu (all kernels: R=rrms,
+    N=X·rrms·W[f,d], 3-input parse). debug_isolate max_abs 0.0156, 0/1536. run_gist big = **3.4939 ms PASS**.
+    NEW Triton bar (RMSNorm/F=1497, do_bench L2-flush) = **4.1519 ms** (28 runs) → we are **~16% faster**.
+  - IMPLICATION: ALL prior gems/bars (3.465, 4.225) were the OLD LayerNorm/F=1491 spec — stale. Every branch
+    must re-baseline gist.cu (gate/pool GEMMs unchanged; only stats-R + N-formula + the W[F,D] weight change).
+    W[F,D] cannot be smem-cached per-d (depends on f) → read W+f·D per row. LayerNorm algebraic factorizations
+    (pull γ/β out of the F-contraction) are IMPOSSIBLE for RMSNorm (W[f,d] sits inside the contraction).
+    RMSNorm numerics are slightly cleaner (max_abs 0.0156 vs 0.0312 — no centering cancellation). All hardware
+    findings hold (box throttled HBM 2.07 TB/s / tensor 807 TF; gate near ceiling; fused-pool relayout dead-end).

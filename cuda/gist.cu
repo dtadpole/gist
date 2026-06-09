@@ -1,13 +1,13 @@
 /*
- * GIST forward — optimized CUDA kernel for the cuda_exec harness (v2).
+ * GIST forward — optimized CUDA kernel for the cuda_exec harness (v2, RMSNorm).
  *
- * inputs[0]=X[B,F,D], inputs[1]=P[F,Q*F], inputs[2]=gamma[D], inputs[3]=beta[D]
+ * inputs[0]=X[B,F,D], inputs[1]=P[F,Q*F], inputs[2]=W[F,D]  (RMSNorm weight, bf16)
  * outputs[0]=O[B,Q,D].  Dims from env CUDA_EXEC_PARAM_GIST_{B,F,D,Q}.
  *
- *   stats : M[b,f]=mean_d X, R[b,f]=rstd_d X    (warp-per-row, coalesced)
+ *   stats : M[b,f]=mean_d X, R[b,f]=rrms_d X = rsqrt(mean_d(X^2)+eps)  (warp-per-row)
  *   gate  : L[b,q,g]=sigmoid(M[b,:] @ P[:,q*F+g])  (WMMA bf16 tensor-core GEMM)
  *   pool  : O[b,q,d]=sum_g L[b,q,g] * N[b,g,d]   (tiled shared-memory GEMM;
- *           N = LayerNorm(X)*gamma+beta recomputed on the fly)
+ *           N = RMSNorm(X) = X * rrms * W[f,d] recomputed on the fly; no centering, no bias)
  */
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -68,56 +68,25 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 // LinearCombination (raw logits out, no 293M exp in the epilogue). Used to MEASURE the sigmoid-epilogue
 // cost on the gate's tensor pipeline (sigmoid is then applied downstream by k_sigpad).
 namespace gategemm_ns {
-using cute::Shape; using cute::_1; using cute::_2; using cute::_64; using cute::_128; using cute::_192; using cute::_256;
+using cute::Shape; using cute::_1; using cute::_64; using cute::_128; using cute::_256;
 using ElementA = cutlass::bfloat16_t; using LayoutA = cutlass::layout::ColumnMajor;
 using ElementB = cutlass::bfloat16_t; using LayoutB = cutlass::layout::RowMajor;
 using ElementC = cutlass::bfloat16_t; using LayoutC = cutlass::layout::RowMajor;
 using ElementAcc = float;
 constexpr int AlignA = 8, AlignB = 8, AlignC = 8;
-// --- tunable knobs (override per-rev via -DGATE_*). Defaults = the verified 3.465 base. ---
-#ifndef GATE_TILE_M
-#define GATE_TILE_M _128
-#endif
-#ifndef GATE_TILE_N
-#define GATE_TILE_N _256
-#endif
-#ifndef GATE_TILE_K
-#define GATE_TILE_K _64
-#endif
-#ifndef GATE_CLUSTER_M
-#define GATE_CLUSTER_M _1
-#endif
-#ifndef GATE_CLUSTER_N
-#define GATE_CLUSTER_N _1
-#endif
-using TileShape = Shape<GATE_TILE_M, GATE_TILE_N, GATE_TILE_K>;
-using ClusterShape = Shape<GATE_CLUSTER_M, GATE_CLUSTER_N, _1>;
-// Mainloop+epilogue schedule. Default = cooperative (3.465 base). GATE_PINGPONG -> pingpong mainloop
-// + non-cooperative TmaWarpSpecialized epilogue (different barrier topology).
-#ifdef GATE_PINGPONG
-using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
-using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;
-#else
-using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
-using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
-#endif
+using TileShape = Shape<_128, _256, _64>;
+using ClusterShape = Shape<_1, _1, _1>;
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementAcc,
     ElementC, LayoutC, AlignC, ElementC, LayoutC, AlignC,
-    EpilogueSchedule>::CollectiveOp;
-// StageCount: default = auto carveout (3.465 base). GATE_STAGES=N -> fixed N stages (free smem for occupancy).
-#ifdef GATE_STAGES
-using StageCountType = cutlass::gemm::collective::StageCount<GATE_STAGES>;
-#else
-using StageCountType = cutlass::gemm::collective::StageCountAutoCarveout<(int)sizeof(typename CollectiveEpilogue::SharedStorage)>;
-#endif
+    cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
     ElementA, LayoutA, AlignA, ElementB, LayoutB, AlignB, ElementAcc,
     TileShape, ClusterShape,
-    StageCountType,
-    KernelSchedule>::CollectiveOp;
+    cutlass::gemm::collective::StageCountAutoCarveout<(int)sizeof(typename CollectiveEpilogue::SharedStorage)>,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace gategemm_ns
@@ -248,12 +217,12 @@ __device__ __forceinline__ void wgmma_cute_m64n64k16(float* d, uint64_t da, uint
         cute_gmma::ScaleOut::One);   // scaleD=1, always accumulate
 }
 
-// stats + fused LayerNorm, one warp per RPW rows over B*Fp rows (one X read).
-// Writes M[b,f] (bf16, COLUMN-major for the unpadded gate), R[b,f] (fp32), and N_pad[b,f,:]
+// stats + fused RMSNorm, one warp per RPW rows over B*Fp rows (one X read).
+// Writes M[b,f] (bf16, COLUMN-major for the unpadded gate), R[b,f]=rrms (fp32), and N_pad[b,f,:]
 // (bf16, the pool's WGMMA B-operand; pad rows f in [F,Fp) -> 0). NITER=ceil((D/2)/32)=3 for D=192.
 constexpr int RPW = 1, NITER = 3;
 
-// stats-only variant: writes ONLY M[b,f] and R[b,f], skips N_pad (for fused pool path).
+// stats-only variant: writes ONLY M[b,f] and R[b,f]=rrms, skips N_pad (for fused pool path).
 __global__ void k_stats_mr(const __nv_bfloat16* __restrict__ X,
                            __nv_bfloat16* __restrict__ M, float* __restrict__ R,
                            int B, int F, int Fp, int D, float eps) {
@@ -284,18 +253,19 @@ __global__ void k_stats_mr(const __nv_bfloat16* __restrict__ X,
     #pragma unroll
     for (int r = 0; r < RPW; r++) {
         if (!ok[r] || ff[r] >= F) continue;
-        float m = s[r] / D, var = s2[r] / D - m * m; if (var < 0.f) var = 0.f;
-        float rstd = rsqrtf(var + eps);
-        if (lane == 0) { M[(long)ff[r] * B + bb[r]] = __float2bfloat16(m); R[(long)bb[r] * F + ff[r]] = rstd; }
+        float m = s[r] / D;                          // gate input (mean over D) — unchanged
+        float rrms = rsqrtf(s2[r] / D + eps);        // RMSNorm: rsqrt(mean(X^2)+eps), no -m*m centering
+        if (lane == 0) { M[(long)ff[r] * B + bb[r]] = __float2bfloat16(m); R[(long)bb[r] * F + ff[r]] = rrms; }
     }
 }
-// N-only LayerNorm: reads X + M (col-major bf16) + R + gamma/beta -> Npad[B,Fp,D]. Runs CONCURRENTLY
+// N-only RMSNorm: reads X + R(rrms) + W[F,D] -> Npad[B,Fp,D]. Runs CONCURRENTLY
 // with the gate on a 2nd stream (the gate needs only M, and is at 19% DRAM -> N's traffic hides in the
-// spare bandwidth). f>=F rows -> 0. One warp per (b,f) row.
+// spare bandwidth). f>=F rows -> 0. One warp per (b,f) row. N = X * rrms * W[f,d] (no centering, no bias).
 __global__ void k_stats_n(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ M,
                           const float* __restrict__ R, __nv_bfloat16* __restrict__ Npad,
-                          const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                          const __nv_bfloat16* __restrict__ W,
                           int B, int F, int Fp, int D) {
+    (void)M;
     long warpId = (long)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     long total = (long)B * Fp;
     if (warpId >= total) return;
@@ -306,29 +276,25 @@ __global__ void k_stats_n(const __nv_bfloat16* __restrict__ X, const __nv_bfloat
         for (int i = 0; i < NITER; i++) { int d2 = lane + i * 32; if (d2 < D2) n2[d2] = __float2bfloat162_rn(0.f); }
         return;
     }
-    const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(GAMMA);
-    const __nv_bfloat162* be2 = reinterpret_cast<const __nv_bfloat162*>(BETA);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(W + (long)f * D);   // per-(feature,channel) weight row
     const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X + ((long)b * F + f) * D);
-    float mbf = b2f(M[(long)f * B + b]);   // bf16 mean (col-major), matches k_stats
-    float rstd = R[(long)b * F + f];
+    float rrms = R[(long)b * F + f];
     for (int i = 0; i < NITER; i++) { int d2 = lane + i * 32;
-        if (d2 < D2) { __nv_bfloat162 v = x2[d2], g = g2[d2], be = be2[d2];
-            float n0 = (b2f(v.x) - mbf) * rstd * b2f(g.x) + b2f(be.x);
-            float n1 = (b2f(v.y) - mbf) * rstd * b2f(g.y) + b2f(be.y);
+        if (d2 < D2) { __nv_bfloat162 v = x2[d2], w = w2[d2];
+            float n0 = b2f(v.x) * rrms * b2f(w.x);
+            float n1 = b2f(v.y) * rrms * b2f(w.y);
             n2[d2] = __halves2bfloat162(__float2bfloat16(n0), __float2bfloat16(n1)); } }
 }
 
 __global__ void k_stats(const __nv_bfloat16* __restrict__ X,
                         __nv_bfloat16* __restrict__ M, float* __restrict__ R,
                         __nv_bfloat16* __restrict__ Npad,
-                        const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                        const __nv_bfloat16* __restrict__ W,
                         int B, int F, int Fp, int D, float eps) {
     int lane = threadIdx.x & 31;
     long warpId = (long)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     long total = (long)B * Fp, base = warpId * RPW;
     int D2 = D >> 1;
-    const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(GAMMA);
-    const __nv_bfloat162* be2 = reinterpret_cast<const __nv_bfloat162*>(BETA);
     __nv_bfloat162 xv[RPW][NITER];
     float s[RPW], s2[RPW]; int bb[RPW], ff[RPW]; bool ok[RPW];
     #pragma unroll
@@ -357,15 +323,15 @@ __global__ void k_stats(const __nv_bfloat16* __restrict__ X,
             for (int i = 0; i < NITER; i++) { int d2 = lane + i * 32; if (d2 < D2) n2[d2] = __float2bfloat162_rn(0.f); }
             continue;
         }
-        float m = s[r] / D, var = s2[r] / D - m * m; if (var < 0.f) var = 0.f;
-        float rstd = rsqrtf(var + eps);
-        float mbf = b2f(__float2bfloat16(m));
-        if (lane == 0) { M[(long)ff[r] * B + bb[r]] = __float2bfloat16(m); R[(long)bb[r] * F + ff[r]] = rstd; }  // M column-major [B,F]
+        float m = s[r] / D;                          // gate input (mean over D) — unchanged
+        float rrms = rsqrtf(s2[r] / D + eps);        // RMSNorm: rsqrt(mean(X^2)+eps), no -m*m centering
+        if (lane == 0) { M[(long)ff[r] * B + bb[r]] = __float2bfloat16(m); R[(long)bb[r] * F + ff[r]] = rrms; }  // M column-major [B,F]
+        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(W + (long)ff[r] * D);  // per-(feature,channel) weight row
         #pragma unroll
         for (int i = 0; i < NITER; i++) { int d2 = lane + i * 32;
-            if (d2 < D2) { __nv_bfloat162 v = xv[r][i], g = g2[d2], be = be2[d2];
-                float n0 = (b2f(v.x) - mbf) * rstd * b2f(g.x) + b2f(be.x);
-                float n1 = (b2f(v.y) - mbf) * rstd * b2f(g.y) + b2f(be.y);
+            if (d2 < D2) { __nv_bfloat162 v = xv[r][i], w = w2[d2];
+                float n0 = b2f(v.x) * rrms * b2f(w.x);     // RMSNorm: X * rrms * W[f,d], no centering, no bias
+                float n1 = b2f(v.y) * rrms * b2f(w.y);
                 n2[d2] = __halves2bfloat162(__float2bfloat16(n0), __float2bfloat16(n1)); } }
     }
 }
@@ -595,15 +561,15 @@ constexpr int WM = 16, WN = 16, WK = 16, DMAX = 192, FPMAX = 1536, DPW = 3, MAXW
 constexpr int DPB = 96, KT = 64, KSUB = KT / WK, NLDB = DPB + 4, NCOLB = DPB / WN, DGB = NCOLB / DPW;
 __global__ void k_pool_fused(const __nv_bfloat16* __restrict__ SL, const __nv_bfloat16* __restrict__ X,
                              const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                             const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                             const __nv_bfloat16* __restrict__ W,
                              __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, doff = blockIdx.y * DPB, tid = threadIdx.x, nt = blockDim.x, warp = tid >> 5, lane = tid & 31;
     int warp_q = warp / DGB, warp_d = warp % DGB, q0 = warp_q * WM, cbase = warp_d * DPW, qg = Q / WM;
-    __shared__ float gsh[DPB], bsh[DPB], Mall[FPMAX], Rall[FPMAX];
+    __shared__ float Rall[FPMAX];
     __shared__ __nv_bfloat16 Xsh[2][KT * DPB], SLsh[2][8 * (WM * KT)], Nsh[KT * NLDB];
     __shared__ float Otmp[MAXW * (WM * WN)];
-    for (int d = tid; d < DPB; d += nt) { gsh[d] = b2f(GAMMA[doff + d]); bsh[d] = b2f(BETA[doff + d]); }
-    for (int f = tid; f < Fp; f += nt) { Mall[f] = (f < F) ? b2f(M[(long)f * B + b]) : 0.f; Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
+    for (int f = tid; f < Fp; f += nt) { Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
     wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc[DPW];
     #pragma unroll
     for (int c = 0; c < DPW; c++) wmma::fill_fragment(acc[c], 0.f);
@@ -627,7 +593,7 @@ __global__ void k_pool_fused(const __nv_bfloat16* __restrict__ SL, const __nv_bf
         int cur = k & 1, g0 = k * KT;
         const __nv_bfloat16* xs = Xsh[cur];
         for (int i = tid; i < KT * DPB; i += nt) { int fl = i / DPB, dl = i - fl * DPB; int f = g0 + fl;
-            Nsh[fl * NLDB + dl] = (f < F) ? __float2bfloat16((b2f(xs[i]) - Mall[f]) * Rall[f] * gsh[dl] + bsh[dl]) : __float2bfloat16(0.f); }
+            Nsh[fl * NLDB + dl] = (f < F) ? __float2bfloat16(b2f(xs[i]) * Rall[f] * b2f(W[(long)f * D + doff + dl])) : __float2bfloat16(0.f); }
         __syncthreads();
         #pragma unroll
         for (int ks = 0; ks < KSUB; ks++) {
@@ -673,17 +639,17 @@ constexpr int WS_KSUB = WS_KT / 16, WS_NCOL = WS_DPB / 16, WS_NLDB = WS_DPB + 4;
 __global__ __launch_bounds__(512, 1)
 void k_pool_warpspec(const __nv_bfloat16* __restrict__ SL, const __nv_bfloat16* __restrict__ X,
                      const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                     const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                     const __nv_bfloat16* __restrict__ W,
                      __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, doff = blockIdx.y * WS_DPB, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     bool isProd = warp >= WS_NCONS;             // warps 0-7 = consumers, 8-15 = producers
     int pw = warp - WS_NCONS, cw = warp;        // producer idx / consumer idx (= q-tile)
-    __shared__ float gsh[WS_DPB], bsh[WS_DPB], Mall[FPMAX], Rall[FPMAX];
+    __shared__ float Rall[FPMAX];
     __shared__ __nv_bfloat16 Xsh[2][WS_KT * WS_DPB], Nsh[2][WS_KT * WS_NLDB];
     __shared__ float Otmp[WS_NCONS * (WM * WN)];
-    for (int d = tid; d < WS_DPB; d += 512) { gsh[d] = b2f(GAMMA[doff + d]); bsh[d] = b2f(BETA[doff + d]); }
-    for (int f = tid; f < Fp; f += 512) { Mall[f] = (f < F) ? b2f(M[(long)f * B + b]) : 0.f; Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
-    __syncthreads();                            // Mall/Rall/gsh/bsh ready for all warps
+    for (int f = tid; f < Fp; f += 512) { Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
+    __syncthreads();                            // Rall ready for all warps
     int ntiles = (F + WS_KT - 1) / WS_KT;
 
     if (isProd) {
@@ -711,7 +677,7 @@ void k_pool_warpspec(const __nv_bfloat16* __restrict__ SL, const __nv_bfloat16* 
             for (int i = ptid; i < WS_KT * WS_DPB; i += 256) {
                 int fl = i / WS_DPB, dl = i - fl * WS_DPB, f = g0 + fl;
                 float v = 0.f;
-                if (f < F) { float x = b2f(xs[i]); v = (x - Mall[f]) * Rall[f] * gsh[dl] + bsh[dl]; }
+                if (f < F) { float x = b2f(xs[i]); v = x * Rall[f] * b2f(W[(long)f * D + doff + dl]); }
                 Nsh[buf][fl * WS_NLDB + dl] = __float2bfloat16(v);
             }
             ws_bar_arrive(1 + buf);             // full[buf]: N(buf) ready
@@ -843,23 +809,18 @@ __global__ __launch_bounds__(128, 4)
 void k_pool_wgmma_fused(const __nv_bfloat16* __restrict__ g_L,
                         const __nv_bfloat16* __restrict__ X,
                         const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                        const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                        const __nv_bfloat16* __restrict__ W,
                         __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, q0 = blockIdx.y * 64, nt = blockIdx.z, dbase = nt * 64;  // this block's n64 tile
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     __shared__ __nv_bfloat16 As[64 * WG_KT];         // A: K-major bricks (g_L for this q-tile)
     __shared__ __nv_bfloat16 Bs[WG_KT * 64];         // B: MN-major bricks (N for THIS n64 tile only)
     __shared__ __nv_bfloat16 Xsh[2][WG_KT * 64];     // double-buffer X (64 D-cols of this n-tile)
-    __shared__ float Mtile[WG_KT], Rtile[WG_KT];     // M,R for the CURRENT K-tile only (was full Fp -> 12KB)
-    __shared__ float gsh[64], bsh[64];               // gamma, beta for this n-tile's 64 cols
+    __shared__ float Rtile[WG_KT];                   // R(rrms) for the CURRENT K-tile only
     float acc[32];                                    // ONE m64n64 tile = 32 fp32 regs (the occupancy win)
     #pragma unroll
     for (int i = 0; i < 32; i++) acc[i] = 0.f;
-
-    for (int d = tid; d < 64; d += 128) {
-        gsh[d] = b2f(GAMMA[dbase + d]);
-        bsh[d] = b2f(BETA[dbase + d]);
-    }
     __syncthreads();
 
     int ntilesK = Fp / WG_KT;
@@ -898,23 +859,22 @@ void k_pool_wgmma_fused(const __nv_bfloat16* __restrict__ g_L,
             }
             __pipeline_commit();
         }
-        // Load this K-tile's 64 M/R values (M col-major M[f*B+b], R row-major R[b*F+f])
+        // Load this K-tile's 64 R(rrms) values (R row-major R[b*F+f])
         for (int fl = tid; fl < WG_KT; fl += 128) {
             int f = k0 + fl;
-            Mtile[fl] = (f < F) ? b2f(M[(long)f * B + b]) : 0.f;
             Rtile[fl] = (f < F) ? R[(long)b * F + f] : 0.f;
         }
         __pipeline_wait_prior(t + 1 < ntilesK ? 1 : 0);
         __syncthreads();
 
-        // Compute N from staged X (this n-tile's 64 D-cols), write MN-major B bricks
+        // Compute N=RMSNorm from staged X (this n-tile's 64 D-cols), write MN-major B bricks: X*rrms*W[f,d]
         const __nv_bfloat16* xs = Xsh[buf];
         for (int i = tid; i < WG_KT * 64; i += 128) {
             int fl = i / 64, dl = i % 64, f = k0 + fl;
             float val = 0.f;
             if (f < F) {
                 float x = b2f(xs[fl * 64 + dl]);
-                val = (x - Mtile[fl]) * Rtile[fl] * gsh[dl] + bsh[dl];
+                val = x * Rtile[fl] * b2f(W[(long)f * D + dbase + dl]);
             }
             int k = fl, nc = dl;
             int off = (k / 8) * kbStride + (nc / 8) * 64 + (k % 8) * 8 + (nc % 8);
@@ -977,8 +937,9 @@ __global__ __launch_bounds__(384, 2)
 void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
                       const __nv_bfloat16* __restrict__ X,
                       const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                      const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                      const __nv_bfloat16* __restrict__ W,
                       __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, q0 = blockIdx.y * 64;
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wg = warp >> 2, wgwarp = warp & 3;
     int wtid = tid & 127;                               // thread index within this warpgroup (0..127)
@@ -987,15 +948,11 @@ void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
     __nv_bfloat16* As  = (__nv_bfloat16*)smem;              // 64*KT  (shared A)
     __nv_bfloat16* Bs  = As + 64 * MWG_KT;                  // 3*KT*64 (per-wg N bricks)
     __nv_bfloat16* Xsh = Bs + MWG_NWG * MWG_KT * 64;        // 2*KT*D  (double-buffer X, all D cols)
-    float* Mtile = (float*)(Xsh + 2 * MWG_KT * D);          // KT
-    float* Rtile = Mtile + MWG_KT;                          // KT
-    float* gsh   = Rtile + MWG_KT;                          // D
-    float* bsh   = gsh + D;                                 // D
+    float* Rtile = (float*)(Xsh + 2 * MWG_KT * D);         // KT  (rrms for current K-tile)
     __nv_bfloat16* Bswg = Bs + wg * (MWG_KT * 64);          // this wg's N region
     float acc[32];
     #pragma unroll
     for (int i = 0; i < 32; i++) acc[i] = 0.f;
-    for (int d = tid; d < D; d += 384) { gsh[d] = b2f(GAMMA[d]); bsh[d] = b2f(BETA[d]); }
 
     const int kbStride = (64 / 8) * 64;                 // = 512 for a 64-wide MN-major B tile
     uint64_t da[MWG_KT / 16], db[MWG_KT / 16];
@@ -1013,7 +970,7 @@ void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
         if (fl < F) __pipeline_memcpy_async(&Xsh[fl * D + dl], &X[((long)b * F + fl) * D + dl], 16);
     }
     __pipeline_commit();
-    __syncthreads();   // gsh/bsh ready
+    __syncthreads();
 
     for (int t = 0; t < ntilesK; t++) {
         int k0 = t * MWG_KT, buf = t & 1;
@@ -1027,7 +984,6 @@ void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
         }
         for (int fl = tid; fl < MWG_KT; fl += 384) {
             int f = k0 + fl;
-            Mtile[fl] = (f < F) ? b2f(M[(long)f * B + b]) : 0.f;
             Rtile[fl] = (f < F) ? R[(long)b * F + f] : 0.f;
         }
         for (int i = tid; i < (64 * MWG_KT) / 8; i += 384) {
@@ -1043,14 +999,14 @@ void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
             }
         }
         __pipeline_wait_prior(t + 1 < ntilesK ? 1 : 0);
-        __syncthreads();   // Xsh[buf], Mtile/Rtile, As ready
+        __syncthreads();   // Xsh[buf], Rtile, As ready
         const __nv_bfloat16* xs = Xsh + buf * (MWG_KT * D);
         for (int i = wtid; i < MWG_KT * 64; i += 128) {
             int fl = i / 64, dl = i % 64, f = k0 + fl;
             float val = 0.f;
             if (f < F) {
                 float x = b2f(xs[fl * D + dbase + dl]);
-                val = (x - Mtile[fl]) * Rtile[fl] * gsh[dbase + dl] + bsh[dbase + dl];
+                val = x * Rtile[fl] * b2f(W[(long)f * D + dbase + dl]);   // RMSNorm: X*rrms*W[f,d]
             }
             int off = (fl / 8) * kbStride + (dl / 8) * 64 + (fl % 8) * 8 + (dl % 8);
             Bswg[off] = __float2bfloat16(val);
@@ -1079,57 +1035,45 @@ void k_pool_wgmma_mwg(const __nv_bfloat16* __restrict__ g_L,
 }
 
 // ---------------- MULTI-WARPGROUP FACTORED fused pool (direction C) ----------------
-// LayerNorm folded into the GEMM so B = RAW X (cp.async straight into bricks; NO N-materialize/transform):
-//   O[q,d] = gamma[d]*( sum_f (L*R)[q,f]*X[f,d] - sum_f (L*R)[q,f]*M[f] ) + beta[d]*( sum_f L[q,f] )
-// (exact algebra: gamma/beta are per-d so pull out; R per-f folds into A's K-columns; M->mLR correction.)
-// A = (L*R) bricks (shared across the 3 D-warpgroups). B = raw X bricks (cp.async double-buffered, aligned).
-// Per-q reductions mLR[q]=sum L*R*M, sL[q]=sum L via smem atomics during A-staging; epilogue applies
-// gamma/beta + corrections. Removes the entire N-compute smem-shuffle -> pool approaches DRAM-bound.
+// NOTE (RMSNorm): the LayerNorm algebraic factorization (B = raw X, gamma/beta pulled out of the GEMM,
+// mLR/sL corrections) DOES NOT hold for RMSNorm — N[f,d] = X[f,d]*rrms[f]*W[f,d] has W INSIDE the f-sum
+// and W is per-(f,d), so it cannot be pulled out of the contraction. This env-gated variant is therefore
+// kept as a correct-but-simple RMSNorm pool (B = materialized N = X*rrms*W, plain epilogue), mirroring
+// k_pool_wgmma_mwg. It is not the factored fast path anymore; retained only so GIST_WGMMA_MWGF compiles+runs.
 __global__ __launch_bounds__(384, 2)
 void k_pool_wgmma_mwgf(const __nv_bfloat16* __restrict__ g_L,
                        const __nv_bfloat16* __restrict__ X,
                        const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                       const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                       const __nv_bfloat16* __restrict__ W,
                        __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, q0 = blockIdx.y * 64;
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wg = warp >> 2, wgwarp = warp & 3;
     int wtid = tid & 127, dbase = wg * 64;
     extern __shared__ char smem[];
-    __nv_bfloat16* As = (__nv_bfloat16*)smem;                       // 64*KT  (LR bricks, shared)
-    __nv_bfloat16* Bs = As + 64 * MWG_KT;                           // 2*3*KT*64 (raw-X bricks, dbl-buf, per-wg)
-    float* Mtile = (float*)(Bs + 2 * MWG_NWG * MWG_KT * 64);        // KT
-    float* Rtile = Mtile + MWG_KT;                                  // KT
-    float* gsh   = Rtile + MWG_KT;                                  // D
-    float* bsh   = gsh + D;                                         // D
-    float* sLsh  = bsh + D;                                         // 64
-    float* mLRsh = sLsh + 64;                                       // 64
+    __nv_bfloat16* As  = (__nv_bfloat16*)smem;             // 64*KT  (shared A = g_L bricks)
+    __nv_bfloat16* Bs  = As + 64 * MWG_KT;                 // 3*KT*64 (per-wg N bricks)
+    __nv_bfloat16* Xsh = Bs + MWG_NWG * MWG_KT * 64;       // 2*KT*D  (double-buffer X, all D cols)
+    float* Rtile = (float*)(Xsh + 2 * MWG_KT * D);         // KT  (rrms for current K-tile)
+    __nv_bfloat16* Bswg = Bs + wg * (MWG_KT * 64);         // this wg's N region
     float acc[32];
     #pragma unroll
     for (int i = 0; i < 32; i++) acc[i] = 0.f;
-    for (int d = tid; d < D; d += 384) { gsh[d] = b2f(GAMMA[d]); bsh[d] = b2f(BETA[d]); }
-    for (int i = tid; i < 64; i += 384) { sLsh[i] = 0.f; mLRsh[i] = 0.f; }
 
     const int kbStride = (64 / 8) * 64;
-    uint64_t da[MWG_KT/16], db0[MWG_KT/16], db1[MWG_KT/16];
-    __nv_bfloat16* Bs0 = Bs + (0 * MWG_NWG + wg) * (MWG_KT * 64);
-    __nv_bfloat16* Bs1 = Bs + (1 * MWG_NWG + wg) * (MWG_KT * 64);
+    uint64_t da[MWG_KT/16], db[MWG_KT/16];
     #pragma unroll
     for (int ks = 0; ks < MWG_KT/16; ks++) {
         int kk = ks * 16;
-        da[ks]  = wg_desc(&As[(kk/16)*1024], 128, 256);
-        db0[ks] = wg_desc(&Bs0[(kk/8)*kbStride], (uint32_t)(64*16), 128);
-        db1[ks] = wg_desc(&Bs1[(kk/8)*kbStride], (uint32_t)(64*16), 128);
+        da[ks] = wg_desc(&As[(kk/16)*1024], 128, 256);
+        db[ks] = wg_desc(&Bswg[(kk/8)*kbStride], (uint32_t)(64*16), 128);
     }
 
     int ntilesK = Fp / MWG_KT;
-    const int nchunkB = (MWG_KT * 64) / 8;
-    // prologue: cp.async X(0) -> Bs[0][wg] (this wg's d-tile)
-    for (int i = wtid; i < nchunkB; i += 128) {
-        int fl = (i*8)/64, dl0 = (i*8)%64;
-        if (fl < F) {
-            int off = (fl/8)*kbStride + (dl0/8)*64 + (fl%8)*8 + (dl0%8);
-            __pipeline_memcpy_async(&Bs0[off], &X[((long)b*F + fl)*D + dbase + dl0], 16);
-        }
+    const int nchunkX = (MWG_KT * D) / 8;
+    for (int i = tid; i < nchunkX; i += 384) {
+        int fl = (i * 8) / D, dl = (i * 8) - fl * D;
+        if (fl < F) __pipeline_memcpy_async(&Xsh[fl * D + dl], &X[((long)b * F + fl) * D + dl], 16);
     }
     __pipeline_commit();
     __syncthreads();
@@ -1138,66 +1082,63 @@ void k_pool_wgmma_mwgf(const __nv_bfloat16* __restrict__ g_L,
         int k0 = t * MWG_KT, buf = t & 1;
         if (t + 1 < ntilesK) {
             int k1 = (t+1)*MWG_KT, nbuf = (t+1)&1;
-            __nv_bfloat16* Bn = Bs + (nbuf*MWG_NWG + wg)*(MWG_KT*64);
-            for (int i = wtid; i < nchunkB; i += 128) {
-                int fl=(i*8)/64, dl0=(i*8)%64, f=k1+fl;
-                if (f < F) {
-                    int off=(fl/8)*kbStride + (dl0/8)*64 + (fl%8)*8 + (dl0%8);
-                    __pipeline_memcpy_async(&Bn[off], &X[((long)b*F+f)*D + dbase + dl0], 16);
-                }
+            for (int i = tid; i < nchunkX; i += 384) {
+                int fl = (i * 8) / D, dl = (i * 8) - fl * D, f = k1 + fl;
+                if (f < F) __pipeline_memcpy_async(&Xsh[nbuf * (MWG_KT * D) + fl * D + dl], &X[((long)b * F + f) * D + dl], 16);
             }
             __pipeline_commit();
         }
         for (int fl = tid; fl < MWG_KT; fl += 384) {
             int f = k0 + fl;
-            Mtile[fl] = (f<F) ? b2f(M[(long)f*B + b]) : 0.f;
             Rtile[fl] = (f<F) ? R[(long)b*F + f] : 0.f;
         }
-        __syncthreads();   // Mtile/Rtile ready
-        // Stage A = (L*R) bricks (shared). Accumulate sL, mLR via smem atomics.
-        for (int i = tid; i < (64*MWG_KT)/8; i += 384) {
-            int q = (i*8)/MWG_KT, fl = (i*8)%MWG_KT, f = k0 + fl;
-            int off = (fl/16)*1024 + (q/8)*128 + ((fl%16)/8)*64 + (q%8)*8;
-            const __nv_bfloat16* src = g_L + ((long)(b*Q + q0 + q))*F + f;
-            float sLp = 0.f, mLRp = 0.f;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                int ff = f + j;
-                float Lv = (ff < F) ? b2f(src[j]) : 0.f;
-                float LR = Lv * Rtile[fl + j];
-                As[off + j] = __float2bfloat16(LR);
-                sLp  += Lv;
-                mLRp += LR * Mtile[fl + j];
+        // Stage A = g_L (sigmoid'd by gate) bricks, shared across the 3 D-warpgroups
+        for (int i = tid; i < (64 * MWG_KT) / 8; i += 384) {
+            int q = (i * 8) / MWG_KT, fl = (i * 8) % MWG_KT, f = k0 + fl;
+            int off = (fl / 16) * 1024 + (q / 8) * 128 + ((fl % 16) / 8) * 64 + (q % 8) * 8;
+            const __nv_bfloat16* src = g_L + ((long)(b * Q + q0 + q)) * F + f;
+            if (f + 8 <= F) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) As[off + j] = src[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) As[off + j] = (f + j < F) ? src[j] : __float2bfloat16(0.f);
             }
-            atomicAdd(&sLsh[q],  sLp);
-            atomicAdd(&mLRsh[q], mLRp);
         }
         __pipeline_wait_prior(t + 1 < ntilesK ? 1 : 0);
-        __syncthreads();   // X (Bs[buf]) + As ready
+        __syncthreads();   // Xsh[buf], Rtile, As ready
+        // Compute N = X*rrms*W[f,d] into this wg's B bricks
+        const __nv_bfloat16* xs = Xsh + buf * (MWG_KT * D);
+        for (int i = wtid; i < MWG_KT * 64; i += 128) {
+            int fl = i / 64, dl = i % 64, f = k0 + fl;
+            float val = 0.f;
+            if (f < F) {
+                float x = b2f(xs[fl * D + dbase + dl]);
+                val = x * Rtile[fl] * b2f(W[(long)f * D + dbase + dl]);
+            }
+            int off = (fl / 8) * kbStride + (dl / 8) * 64 + (fl % 8) * 8 + (dl % 8);
+            Bswg[off] = __float2bfloat16(val);
+        }
+        __syncthreads();   // A and all Bs ready for wgmma
         wgmma_async_proxy_fence();
         wgmma_cute_fence32(acc);
         cute::warpgroup_arrive();
         #pragma unroll
-        for (int ks = 0; ks < MWG_KT/16; ks++)
-            wgmma_cute_m64n64k16(acc, da[ks], (buf ? db1[ks] : db0[ks]));
+        for (int ks = 0; ks < MWG_KT/16; ks++) wgmma_cute_m64n64k16(acc, da[ks], db[ks]);
         cute::warpgroup_commit_batch();
         cute::warpgroup_wait<0>();
         wgmma_cute_fence32(acc);
         __syncthreads();   // before next tile overwrites As (shared)
     }
-    __syncthreads();   // all sL/mLR atomics complete
-    // Epilogue: O[q,d] = gamma[d]*(acc - mLR[q]) + beta[d]*sL[q]
+    // Epilogue: this warpgroup's n64 tile -> O[:, dbase:dbase+64]
     #pragma unroll
     for (int a = 0; a < 8; a++) {
-        int ql0 = 16*wgwarp + lane/4, ql1 = ql0 + 8;
-        int row0 = q0 + ql0, row1 = q0 + ql1;
-        int col0 = dbase + 8*a + (lane%4)*2, col1 = col0 + 1;
-        float g0 = gsh[col0], g1 = gsh[col1], be0 = bsh[col0], be1 = bsh[col1];
-        float mL0 = mLRsh[ql0], mL1 = mLRsh[ql1], sL0 = sLsh[ql0], sL1 = sLsh[ql1];
-        O[((long)b*Q + row0)*D + col0] = __float2bfloat16(g0*(acc[4*a+0] - mL0) + be0*sL0);
-        O[((long)b*Q + row0)*D + col1] = __float2bfloat16(g1*(acc[4*a+1] - mL0) + be1*sL0);
-        O[((long)b*Q + row1)*D + col0] = __float2bfloat16(g0*(acc[4*a+2] - mL1) + be0*sL1);
-        O[((long)b*Q + row1)*D + col1] = __float2bfloat16(g1*(acc[4*a+3] - mL1) + be1*sL1);
+        int row0 = q0 + 16 * wgwarp + lane / 4, row1 = row0 + 8;
+        int col0 = dbase + 8 * a + (lane % 4) * 2, col1 = col0 + 1;
+        O[((long)b * Q + row0) * D + col0] = __float2bfloat16(acc[4 * a + 0]);
+        O[((long)b * Q + row0) * D + col1] = __float2bfloat16(acc[4 * a + 1]);
+        O[((long)b * Q + row1) * D + col0] = __float2bfloat16(acc[4 * a + 2]);
+        O[((long)b * Q + row1) * D + col1] = __float2bfloat16(acc[4 * a + 3]);
     }
 }
 
@@ -1214,18 +1155,18 @@ __global__ __launch_bounds__(256, 5)
 void k_pool_mpf(const __nv_bfloat16* __restrict__ g_L,
                 const __nv_bfloat16* __restrict__ X,
                 const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                const __nv_bfloat16* __restrict__ W,
                 __nv_bfloat16* __restrict__ O, int B, int F, int Fp, int D, int Q) {
+    (void)M;
     int b = blockIdx.x, doff = blockIdx.y * MPF_DPB, qoff = blockIdx.z * MPF_QPB;
     int tid = threadIdx.x, nt = blockDim.x, warp = tid >> 5, lane = tid & 31;
     // 8 warps: 4 q-tiles (16 rows each) × 2 d-groups (3 n16-cols each). Each warp does 1 q-tile now.
     // warp_d=warp%2, warp_q=warp/2 (0..3). acc[1][3] → 24 regs (vs 48 before).
     int warp_d = warp % 2, warp_q = warp / 2, cbase = warp_d * 3;
-    __shared__ float gsh[MPF_DPB], bsh[MPF_DPB], Mall[FPMAX], Rall[FPMAX];
+    __shared__ float Rall[FPMAX];
     __shared__ __nv_bfloat16 Xsh[2][MPF_KT * MPF_DPB], Ash[2][MPF_QPB * MPF_KT], Nsh[MPF_KT * MPF_NLDB];
     __shared__ float Otmp[8 * (16 * 16)];
-    for (int d = tid; d < MPF_DPB; d += nt) { gsh[d] = b2f(GAMMA[doff + d]); bsh[d] = b2f(BETA[doff + d]); }
-    for (int f = tid; f < Fp; f += nt) { Mall[f] = (f < F) ? b2f(M[(long)f * B + b]) : 0.f; Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
+    for (int f = tid; f < Fp; f += nt) { Rall[f] = (f < F) ? R[(long)b * F + f] : 0.f; }
     int ntiles = (F + MPF_KT - 1) / MPF_KT, nchunkX = (MPF_KT * MPF_DPB) / 8, nchunkA = (MPF_QPB * MPF_KT);
     // accumulators PERSIST across the whole K-loop (1 q-tile x 3 d-tiles per warp) -> the reduction
     // over all F accumulates here; store to O ONCE after the loop.
@@ -1251,9 +1192,9 @@ void k_pool_mpf(const __nv_bfloat16* __restrict__ g_L,
         __pipeline_wait_prior(k + 1 < ntiles ? 1 : 0);
         __syncthreads();
         const __nv_bfloat16* xs = Xsh[cur];
-        // Compute N from X (this K-tile) while the NEXT A is being loaded in the background
+        // Compute N=RMSNorm (X*rrms*W[f,d]) from X (this K-tile) while the NEXT A is being loaded in the background
         for (int i = tid; i < MPF_KT * MPF_DPB; i += nt) { int fl = i / MPF_DPB, dl = i - fl * MPF_DPB; int f = g0 + fl;
-            Nsh[fl * MPF_NLDB + dl] = (f < F) ? __float2bfloat16((b2f(xs[i]) - Mall[f]) * Rall[f] * gsh[dl] + bsh[dl]) : __float2bfloat16(0.f); }
+            Nsh[fl * MPF_NLDB + dl] = (f < F) ? __float2bfloat16(b2f(xs[i]) * Rall[f] * b2f(W[(long)f * D + doff + dl])) : __float2bfloat16(0.f); }
         __syncthreads();
         // WMMA on current K-tile (reads Ash[cur], Nsh). Overlap: next A loads happen during this compute.
         #pragma unroll
@@ -1293,18 +1234,16 @@ void k_pool_mpf(const __nv_bfloat16* __restrict__ g_L,
 constexpr int PQ = 16, PG = 32, PBD = 256;   // PBD >= D
 __global__ void k_pool(const __nv_bfloat16* __restrict__ L, const __nv_bfloat16* __restrict__ X,
                        const __nv_bfloat16* __restrict__ M, const float* __restrict__ R,
-                       const __nv_bfloat16* __restrict__ GAMMA, const __nv_bfloat16* __restrict__ BETA,
+                       const __nv_bfloat16* __restrict__ W,
                        __nv_bfloat16* __restrict__ O, int B, int F, int D, int Q) {
+    (void)M;
     __shared__ float Ls[PQ][PG];
-    __shared__ float Ms[PG];
     __shared__ float Rs[PG];
     int b = blockIdx.y, q0 = blockIdx.x * PQ;
     int d = threadIdx.x;                       // one channel per thread
     float acc[PQ];
     #pragma unroll
     for (int i = 0; i < PQ; i++) acc[i] = 0.f;
-    float gamma = (d < D) ? b2f(GAMMA[d]) : 0.f;
-    float beta  = (d < D) ? b2f(BETA[d]) : 0.f;
 
     for (int g0 = 0; g0 < F; g0 += PG) {
         for (int idx = threadIdx.x; idx < PQ * PG; idx += blockDim.x) {
@@ -1314,14 +1253,14 @@ __global__ void k_pool(const __nv_bfloat16* __restrict__ L, const __nv_bfloat16*
         }
         for (int idx = threadIdx.x; idx < PG; idx += blockDim.x) {
             int gg = g0 + idx;
-            Ms[idx] = (gg < F) ? b2f(M[(long)b * F + gg]) : 0.f;
             Rs[idx] = (gg < F) ? R[(long)b * F + gg] : 0.f;
         }
         __syncthreads();
         if (d < D) {
             for (int j = 0; j < PG; j++) {
                 int gg = g0 + j;
-                float nv = (gg < F) ? (b2f(X[((long)b * F + gg) * D + d]) - Ms[j]) * Rs[j] * gamma + beta : 0.f;
+                // RMSNorm: N = X * rrms * W[f,d] (no centering, no bias)
+                float nv = (gg < F) ? b2f(X[((long)b * F + gg) * D + d]) * Rs[j] * b2f(W[(long)gg * D + d]) : 0.f;
                 #pragma unroll
                 for (int i = 0; i < PQ; i++) acc[i] += Ls[i][j] * nv;
             }
@@ -1367,7 +1306,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         cudaMemset(g_SL, 0, (size_t)B * Q * Fp * sizeof(__nv_bfloat16));  // zero ONCE: the f in [F,Fp) pad stays 0
         g_B = B; g_F = F; g_D = D; g_Q = Q;
     }
-    const __nv_bfloat16 *X = inputs[0], *P = inputs[1], *GAMMA = inputs[2], *BETA = inputs[3];
+    const __nv_bfloat16 *X = inputs[0], *P = inputs[1], *W = inputs[2];   // RMSNorm: 3 inputs, W[F,D] weight (no beta)
     __nv_bfloat16* O = outputs[0];
 
     int warps_per_blk = 8;
@@ -1386,7 +1325,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         }
         if (!getenv("GIST_SKIP_POOL")) {
             dim3 mpfgrid(B, D / MPF_DPB, Q / MPF_QPB);  // D-split (2) × Q-split (2) = 4 blocks per b
-            k_pool_mpf<<<mpfgrid, 256, 0, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_mpf<<<mpfgrid, 256, 0, stream>>>(g_L, X, g_M, g_R, W, O, B, F, Fp, D, Q);
         }
         return 0;
     }
@@ -1400,7 +1339,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         }
         if (!getenv("GIST_SKIP_POOL")) {
             dim3 wgrid(B, Q / 64, D / 64);   // + D-tile dim: one n64 tile per block (acc[32], high occ)
-            k_pool_wgmma_fused<<<wgrid, 128, 0, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_wgmma_fused<<<wgrid, 128, 0, stream>>>(g_L, X, g_M, g_R, W, O, B, F, Fp, D, Q);
         }
         return 0;
     }
@@ -1416,18 +1355,19 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         if (!getenv("GIST_SKIP_POOL")) {
             dim3 mwgrid(B, Q / 64);   // one CTA per (batch, q-tile of 64); 3 warpgroups split D
             size_t smem = (size_t)(64 * MWG_KT + MWG_NWG * MWG_KT * 64 + 2 * MWG_KT * D) * sizeof(__nv_bfloat16)
-                        + (size_t)(2 * MWG_KT + 2 * D) * sizeof(float);
+                        + (size_t)(MWG_KT) * sizeof(float);   // Rtile only (RMSNorm: no Mtile/gsh/bsh)
             static bool mwg_attr_set = false;
             if (!mwg_attr_set) {
                 cudaFuncSetAttribute(k_pool_wgmma_mwg, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
                 mwg_attr_set = true;
             }
-            k_pool_wgmma_mwg<<<mwgrid, 384, smem, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_wgmma_mwg<<<mwgrid, 384, smem, stream>>>(g_L, X, g_M, g_R, W, O, B, F, Fp, D, Q);
         }
         return 0;
     }
 
-    // MULTI-WARPGROUP FACTORED pool (direction C): LayerNorm folded into the GEMM (B = raw X).
+    // MULTI-WARPGROUP FACTORED pool (RMSNorm): the LayerNorm factorization doesn't hold for W[F,D];
+    // this variant now materializes N=X*rrms*W (same smem layout as MWG). Kept so the env path compiles+runs.
     if (getenv("GIST_WGMMA_MWGF")) {
         k_stats_mr<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
@@ -1436,14 +1376,14 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         }
         if (!getenv("GIST_SKIP_POOL")) {
             dim3 mwgrid(B, Q / 64);
-            size_t smem = (size_t)(64 * MWG_KT + 2 * MWG_NWG * MWG_KT * 64) * sizeof(__nv_bfloat16)
-                        + (size_t)(2 * MWG_KT + 2 * D + 128) * sizeof(float);
+            size_t smem = (size_t)(64 * MWG_KT + MWG_NWG * MWG_KT * 64 + 2 * MWG_KT * D) * sizeof(__nv_bfloat16)
+                        + (size_t)(MWG_KT) * sizeof(float);   // Rtile only
             static bool mwgf_attr_set = false;
             if (!mwgf_attr_set) {
                 cudaFuncSetAttribute(k_pool_wgmma_mwgf, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
                 mwgf_attr_set = true;
             }
-            k_pool_wgmma_mwgf<<<mwgrid, 384, smem, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_wgmma_mwgf<<<mwgrid, 384, smem, stream>>>(g_L, X, g_M, g_R, W, O, B, F, Fp, D, Q);
         }
         return 0;
     }
@@ -1452,7 +1392,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     // Branch-C measured this is SLOWER (4.02ms): the Sigmoid epilogue's 293M exp competes with the
     // compute-bound gate's tensor pipeline (gate 1.66ms). Also hosts the experimental hand-rolled pools.
     if (getenv("GIST_GATE_SIG")) {
-        k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
+        k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, W, B, F, Fp, D, 1e-5f);
         if (getenv("GIST_SKIP_GATE") == nullptr) {
             int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);   // sigmoid fused in epilogue
             if (rc != 0) return rc;
@@ -1466,13 +1406,13 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
         if (getenv("GIST_WARPSPEC")) {
             k_sigpad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);
             dim3 wgrid(B, D / WS_DPB);
-            k_pool_warpspec<<<wgrid, 512, 0, stream>>>(g_SL, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_warpspec<<<wgrid, 512, 0, stream>>>(g_SL, X, g_M, g_R, W, O, B, F, Fp, D, Q);
             return 0;
         }
         if (getenv("GIST_FUSED_POOL")) {
             k_sigpad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);
             dim3 fgrid(B, D / DPB);
-            k_pool_fused<<<fgrid, (Q / WM) * DGB * 32, 0, stream>>>(g_SL, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
+            k_pool_fused<<<fgrid, (Q / WM) * DGB * 32, 0, stream>>>(g_SL, X, g_M, g_R, W, O, B, F, Fp, D, Q);
             return 0;
         }
         k_repad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);   // L already sigmoid'd; pure repad
@@ -1484,7 +1424,7 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     // plain LinearCombination epilogue (RAW logits — no 293M exp competing with the compute-bound tensor
     // pipeline, gate 1.66->1.26ms), then apply sigmoid in k_sigpad (sigmoid+pad in one memory-bound pass,
     // exp ~free behind DRAM latency: +0.05ms vs k_repad). stats writes M,R,N (one X read).
-    k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
+    k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, W, B, F, Fp, D, 1e-5f);
     if (getenv("GIST_SKIP_GATE") == nullptr) {
         int rc = run_gate_ns(g_M, P, g_L, B, F, QF, stream);   // CUTLASS gate, raw logits (no sigmoid)
         if (rc != 0) return rc;

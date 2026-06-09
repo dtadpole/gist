@@ -4,10 +4,10 @@ reference (per-b / per-q / per-d error structure) to pinpoint the failing stage.
 import os, sys, ctypes, subprocess, math
 import torch
 
-B, F, D, Q = 1536, 1491, 192, 128
+B, F, D, Q = 1536, 1497, 192, 128
 QF = Q * F
 _su = (1.0 / 12.0) ** 0.5
-SCALES = [1.0/_su, 1.0/_su, (1.0/math.sqrt(F))/_su, (1.0/F)/_su]
+SCALES = [1.0/_su, 1.0/_su, (1.0/math.sqrt(F))/_su]   # X, P, W (RMSNorm weight)
 
 def fill(count, seed, scale):  # bit-identical to harness _harness_fill_random_bf16
     idx = torch.arange(count, dtype=torch.int64)
@@ -44,22 +44,21 @@ lib.kernel_run.restype = ctypes.c_int
 dev = torch.device("cuda:0")
 X = fill(B*F*D, 1, SCALES[0]).to(dev).reshape(B, F, D)
 P = fill(F*QF, 2, SCALES[1]).to(dev).reshape(F, QF)
-G = fill(D, 3, SCALES[2]).to(dev)
-Be = fill(D, 4, SCALES[3]).to(dev)
+W = fill(F*D, 3, SCALES[2]).to(dev).reshape(F, D)          # RMSNorm weight [F,D]
 O = torch.zeros(B, Q, D, dtype=torch.bfloat16, device=dev)
 
-ptrs = (ctypes.c_void_p * 4)(X.data_ptr(), P.data_ptr(), G.data_ptr(), Be.data_ptr())
+ptrs = (ctypes.c_void_p * 3)(X.data_ptr(), P.data_ptr(), W.data_ptr())
 outp = (ctypes.c_void_p * 1)(O.data_ptr())
-rc = lib.kernel_run(ptrs, 4, outp, 1, 0, None)
+rc = lib.kernel_run(ptrs, 3, outp, 1, 0, None)
 torch.cuda.synchronize()
 print("kernel_run rc =", rc, flush=True)
 
-# ---- reference (all-bf16, mirrors gist_ref.py) ----
+# ---- reference (all-bf16, mirrors gist_ref.py): RMSNorm, no centering, no bias ----
 Xf = X.float()
-Mbf = Xf.mean(-1).to(torch.bfloat16)                       # [B,F]
+Mbf = Xf.mean(-1).to(torch.bfloat16)                       # [B,F]  gate input (mean over D)
 L = torch.sigmoid((Mbf @ P).float()).view(B, Q, F).to(torch.bfloat16)  # [B,Q,F]
-var = Xf.var(-1, unbiased=False)
-N = (Xf - Mbf.float().unsqueeze(-1)) * torch.rsqrt(var + 1e-5).unsqueeze(-1) * G.float() + Be.float()
+rrms = torch.rsqrt(Xf.pow(2).mean(-1) + 1e-5)              # [B,F]  RMS scale (no centering)
+N = Xf * rrms.unsqueeze(-1) * W.float()[None, :, :]        # [B,F,D]  no bias, W[F,D]
 Oref = torch.bmm(L, N.to(torch.bfloat16)).to(torch.bfloat16)   # [B,Q,D] all-bf16 pool
 
 Oc, Or = O.float(), Oref.float()
