@@ -45,16 +45,17 @@ Design defaults (large-scale target): `B=1536, F=1497, D=192, Q=128`.
 
 ## Results (single H100, B=1536 F=1497 D=192 Q=128, ~994 GFLOP/call)
 
-Same precision (bf16), `triton.testing.do_bench` (warmup + L2-flush + median), all in one session:
+Same precision (bf16), `triton.testing.do_bench` (min latency, L2-flush) on GPU 0 — the harness GPU,
+matching `run_gist.sh`'s `min_ms` (the CUDA kernel measures 3.40 ms there too):
 
 | method (bf16) | latency |
 |---|---|
-| PyTorch eager | 12.5 ms |
-| PyTorch `compile` | 4.29 ms |
-| Triton-fast (`gist_triton_fast_forward`) | 4.20 ms |
-| **CUDA (`cuda/gist.cu`)** | **3.51 ms** |
+| PyTorch eager | 12.6 ms |
+| PyTorch `compile` | 4.26 ms |
+| Triton-fast (`gist_triton_fast_forward`) | 4.19 ms |
+| **CUDA (`cuda/gist.cu`)** | **3.42 ms** |
 
-The **CUDA kernel (`cuda/gist.cu`) is the fastest — ~16 % faster than Triton-fast**, ~18 % vs
+The **CUDA kernel (`cuda/gist.cu`) is the fastest — ~18 % faster than Triton-fast**, ~20 % vs
 `torch.compile`. The lever is the gate GEMM: Triton's `tl.dot` gate reaches only ~37 % of the tensor pipe
 (≈2.6 ms), and `compile` burns ~1.85 ms in memory-bound glue (transpose P, materialize N, sigmoid); the
 CUDA kernel avoids both — a **cuBLAS gate at ≈1.18 ms** (a hand-written inline-PTX WGMMA gate reaches the
@@ -91,7 +92,7 @@ would force a 3D pool accumulator that wrecks occupancy).
 ## Status & next steps
 
 **Status:** forward-only; **done and validated on H100**. Fastest is the **CUDA kernel**
-(`cuda/gist.cu`) at **3.51 ms — ~16 % faster than Triton-fast (4.20 ms)** via a fast tensor-core gate
+(`cuda/gist.cu`) at **3.42 ms — ~18 % faster than Triton-fast (4.19 ms)** via a fast tensor-core gate
 (cuBLAS, ≈1.18 ms) replacing Triton's slow `tl.dot` gate. See Results above; v1 (`gist_triton.py`)
 kept for reference.
 

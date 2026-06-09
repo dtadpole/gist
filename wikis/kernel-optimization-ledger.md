@@ -8,14 +8,15 @@ FORMAT:
   - EVIDENCE: real measured numbers / NCU counters (never invented)
   - IMPLICATION: what other branches should do/avoid
 
-**Measured — ONE method (`triton.testing.do_bench`: warmup + L2-flush + median, design shape, RMSNorm/F=1497, bf16, one session):**
-- **Triton-fast 4.20 ms · CUDA `cuda/gist.cu` 3.51 ms → ~16% faster.** (Context: eager 12.5, torch.compile 4.29.)
-- The cuda_exec harness reports the CUDA kernel at ~3.40 ms — a DIFFERENT timer; for the Triton comparison use the
-  do_bench PAIR above so both are measured the same way. DON'T mix methods (that mixing was the 4.15/4.31/4.41 mess).
+**Measured — ONE method (`triton.testing.do_bench` MIN, L2-flush, GPU 0, design shape RMSNorm/F=1497, bf16):**
+- **Triton-fast 4.19 ms · CUDA `cuda/gist.cu` 3.42 ms → ~18% faster** (do_bench MIN, GPU0; eager 12.6, compile 4.26).
+- METHOD LOCKED: **do_bench MIN on GPU 0** (= the harness GPU + the `run_gist.sh` min_ms statistic; harness reports CUDA 3.40,
+  matching do_bench-min 3.42). The earlier "3.51 / ~16%" was GPU 7 + median (slower GPU + wrong statistic). Mixing GPUs/
+  statistics produced the whole 4.15/4.31/4.41/3.51/3.62 spread — DON'T. One GPU (0), one tool (do_bench), one stat (min).
 
 Targets (user-defined, vs ~4.2 Triton): **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
 
-**Current best (RMSNorm/F=1497): 3.51 ms = ~16% faster than Triton (do_bench).** Gate now **cuBLAS** (unpadded K,
+**Current best (RMSNorm/F=1497): 3.42 ms (do_bench min GPU0 = harness min_ms 3.40) = ~18% faster than Triton (4.19).** Gate **cuBLAS** (unpadded K,
 op_N/op_T layout with M column-major, ≈1.18 ms vs CUTLASS 1.25; the padded-K route was a TRAP — Pp-copy costs
 0.56 ms, dwarfs the ~0.15 GEMM saving). Still SHORT of the 20% bar (3.38). Per-stage (≈ms): stats(M,R,N)≈0.86 ·
 gate≈1.18 (cuBLAS) · sigpad≈0.56 · pool≈0.79.
@@ -261,3 +262,11 @@ gate is at the throttled compute ceiling; gate-mainloop occupancy (PINGPONG/stag
     (pull γ/β out of the F-contraction) are IMPOSSIBLE for RMSNorm (W[f,d] sits inside the contraction).
     RMSNorm numerics are slightly cleaner (max_abs 0.0156 vs 0.0312 — no centering cancellation). All hardware
     findings hold (box throttled HBM 2.07 TB/s / tensor 807 TF; gate near ceiling; fused-pool relayout dead-end).
+
+- **[2026-06-09] PITFALL (branch C, relayed) — TMA from kernel-malloc'd scratch returns CONSTANT GARBAGE**
+  - WHAT: `cp.async.bulk.tensor` (TMA) reading a buffer that was `cudaMalloc`'d AND filled inside the kernel/program
+    returns CONSTANT garbage — even though the buffer's bytes are identical AND compute-sanitizer reports 0 errors.
+    TMA from the HARNESS-provided buffers or other kernel-WRITTEN buffers works fine.
+  - IMPLICATION: a TMA-bulk fused pool that stages through its OWN cudaMalloc'd relayout/scratch buffer will read
+    garbage (silent, sanitizer-clean). TMA the SOURCE buffers (X = harness input, L = gate-written output) directly;
+    do NOT TMA through a self-allocated scratch. Watch for this in the GIST_TMA_POOL work.
