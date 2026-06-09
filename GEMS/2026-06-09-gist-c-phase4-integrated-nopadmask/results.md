@@ -41,13 +41,18 @@ Component techniques (branch B): σ-fuse via `tanh.approx` overlapped in the chu
 inline ([[gist-b-phase3b]]); vectorized int4 stats ([[gist-b-phase3c]]); padded gate / no repad
 ([[gist-b-phase4-gate-padded-norepad]]).
 
+## Productionized — Phase 4 is now the DEFAULT (no env flags), GIST_* stripped
+`kernel_run`'s no-env path *is* this pipeline; the ~18 legacy alternative/debug `GIST_*` selectors were
+removed. Only `GIST_SKIP_GATE`/`GIST_SKIP_POOL` remain (the aggregator's component-differential timing,
+e.g. SKIP_GATE 2.52→1.23 confirms the gate is genuinely timed). Buffers trimmed to what Phase 4 uses
+(g_M, g_R, g_SL, g_Ppad; the 905 MB g_N + g_L allocs are gone).
+
 ## Reproduce
 ```bash
 cd ~/gist/cuda
-GIST_HANDGATE=1 GIST_GATEPAD=1 GIST_FUSESIG=1 GIST_POOLFUSE=1 \
-  GIST_CU=~/gist-opt/dir-c-phase4/gist.cu CUDA_VISIBLE_DEVICES=2 ./run_gist.sh <rev> big
-#   -> passed=true, max_abs 0.015625, total ~2.52ms
-# A/B the mask:  +GIST_PADMASK=1  -> 2.66ms (also PASS); default (no flag) = no mask = 2.52ms.
+GIST_CU=~/gist-opt/dir-c-phase4/gist.cu CUDA_VISIBLE_DEVICES=2 ./run_gist.sh <rev> big
+#   -> passed=true, max_abs 0.015625, total ~2.52ms   (NO GIST_* flags needed — it's the default)
+# verify gate is real:  +GIST_SKIP_GATE=1 -> 1.23ms (correctness breaks); full−skip = gate genuinely timed.
 ```
 driver.py sets `harness_weight_inputs: "1,2"`. Algebra: `algorithm.md`.
 
