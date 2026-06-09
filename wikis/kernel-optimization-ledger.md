@@ -8,21 +8,16 @@ FORMAT:
   - EVIDENCE: real measured numbers / NCU counters (never invented)
   - IMPLICATION: what other branches should do/avoid
 
-**Triton bar (measured, apples-to-apples, do_bench L2-flush, design shape, bf16):**
-- NEW spec (RMSNorm, F=1497): **~4.15 ms** (4.1519 median/28 runs; 4.1857 quick-check `/tmp/bench_triton_rms.py`, 2026-06-09).
-- OLD spec (LayerNorm, F=1491): 4.185 ms do_bench / 4.225 ms harness. (≈ unchanged: RMSNorm is cheaper but F is bigger.)
+**Measured — ONE method (`triton.testing.do_bench`: warmup + L2-flush + median, design shape, RMSNorm/F=1497, bf16, one session):**
+- **Triton-fast 4.22 ms · CUDA `cuda/gist.cu` 3.62 ms → ~14% faster.** (Context: eager 12.5, torch.compile 4.30.)
+- The cuda_exec harness reports the CUDA kernel at ~3.49 ms — a DIFFERENT timer; for the Triton comparison use the
+  do_bench PAIR above so both are measured the same way. DON'T mix methods (that mixing was the 4.15/4.31/4.41 mess).
 
-Targets vs the new bar: **30% goal = <2.91 ms ; 20% min-acceptable = <3.32 ms.** Audited fallback floor ~4.01 ms.
+Targets vs the 4.22 bar: **30% goal = <2.95 ms ; 20% min-acceptable = <3.38 ms.** Audited fallback floor ~4.01 ms.
 
-**Current best — NEW spec (RMSNorm/F=1497), MEASURED 2026-06-09:**
-- Harness (standalone CUDA-event, L2-flush): **3.4939 ms**, passed, max_abs 0.0156, 0/1536.
-- **Fair apples-to-apples (CUDA vs Triton INTERLEAVED, identical clocks, L2-flush, 100 iters): CUDA 3.56 ms
-  vs Triton 4.41 ms → ~19% faster (1.24×).** This is the honest number — interleaving holds the GPU clock
-  constant for both; standalone do_bench lets each boost differently (Triton 4.41 interleaved / 4.31 w-compile
-  / ~4.15 standalone — same kernel, clock-state spread). Compare within-pair ratios, not absolute ms.
-  Migrated from the 3.465 LayerNorm gem (gate-NOSIG + vectorized sigpad); same latency since RMSNorm has the
-  same memory footprint (only drops the −m·m term + uses W[f,d]). Still SHORT of the 20% bar (3.32 standalone).
-- Per-stage (≈, from the LayerNorm gem; structure unchanged): stats(M,R,N)≈0.86 · gate≈1.25 · sigpad≈0.56 · pool≈0.79.
+**Current best (RMSNorm/F=1497): 3.62 ms = ~14% faster than Triton (do_bench).** Migrated from the 3.465 LayerNorm
+gem (gate-NOSIG + vectorized sigpad); same latency (RMSNorm = same memory footprint, only drops −m·m + uses W[f,d]).
+Still SHORT of the 20% bar (3.38). Per-stage (≈ms, structure unchanged): stats(M,R,N)≈0.86 · gate≈1.25 · sigpad≈0.56 · pool≈0.79.
 
 **Prior best (OLD LayerNorm/F=1491, for the record):** 3.465 ms (C gate-NOSIG + vecsigpad, GEM) ;
 3.670 ms (B hand-written CUDA+PTX WGMMA gate at CUTLASS parity, 1.255 ms gate, persistent + TMA-store epilogue).
