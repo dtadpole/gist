@@ -129,5 +129,5 @@ $N$ never lands in HBM (vs the note's 4-grid which writes+reads $N$, 0.9 GB each
 The $g\!\ge\!F$ TMA-OOB-0 here is exactly what makes the Ξ₂ pad-mask removal correct.
 
 ---
-*Caveat: validated on the big design shape (the benchmark oracle). The small sanity shape (B=8/F=320/Q=64) is not
-yet covered by the fused pool's 3D-TMA/smem sizing — independent of the pad-mask (small has Fₚ=F, no pad cols).*
+*Shape-robust: both the big design shape and the small sanity shape (B=8/F=320/Q=64) pass. Generalizations
+(big unchanged): Fₚ=ceil(F/256)·256 (q-aligned N-tiles), gate nM=ceil(B/128), pool O-store box={64,Q}.*

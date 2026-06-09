@@ -699,7 +699,7 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                          const __grid_constant__ CUtensorMap tmLc,
                          __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
     const int ntiles = nM * nN;
     const int ntK = (F + 63) / 64;
@@ -827,7 +827,7 @@ void k_gate_hand_persist_ewg(const __grid_constant__ CUtensorMap tmA, const __gr
                              const __grid_constant__ CUtensorMap tmLc,
                              __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
     const int ntiles = nM * nN;
     const int ntK = (F + 63) / 64;
@@ -1012,7 +1012,7 @@ void k_gate_hand_fused(const __grid_constant__ CUtensorMap tmBp, const __grid_co
                        const __grid_constant__ CUtensorMap tmSL,
                        __nv_bfloat16* __restrict__ SL, int B, int F, int Q, int Fp) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nFB = Fp / HG_BN;                       // f-blocks per q (1536/256=6)
     const int nN = Q * nFB;
     const int ntiles = nM * nN;
@@ -1535,7 +1535,8 @@ static int launch_pool_hand_fused(const __nv_bfloat16* SL, const __nv_bfloat16* 
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
         // O = [B*Q, D] store, CHUNKED: {D(fast), B*Q}, box {64,128}, no swizzle (store 3 col-chunks of 64).
         cuuint64_t gdO[2] = {(cuuint64_t)D, (cuuint64_t)B * Q}, gsO[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxO[2] = {64, HP_BM};
+        cuuint32_t bxO[2] = {64, (cuuint32_t)Q};   // store only this batch's Q rows (Q<HP_BM=128: wg1 computes the
+                                                   // next batch's queries with wrong N -> must NOT be stored, else race)
         cuTensorMapEncodeTiled(&f_tmO, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)O, gdO, gsO, bxO, es2,
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
         f_pSL = SL; f_pX = X; f_pW = W; f_pO = O;
@@ -2220,7 +2221,9 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     int D = env_i("CUDA_EXEC_PARAM_GIST_D", 0), Q = env_i("CUDA_EXEC_PARAM_GIST_Q", 0);
     if (B <= 0 || F <= 0 || D <= 0 || Q <= 0) return 10;
     long QF = (long)Q * F;
-    int Fp = (F + 63) / 64 * 64;              // pad K to a multiple of 64 (the pool uses a 64-row K-tile)
+    int Fp = (F + 255) / 256 * 256;           // pad features to a multiple of 256: pool K-tile is 64 AND the
+                                              // padded gate's 256-wide N-tiles must align to q (Fp%256==0 ->
+                                              // no q-boundary crossing). Big F=1497 -> 1536 (unchanged).
     long QFp = (long)Q * Fp;
     if (B != g_B || F != g_F || D != g_D || Q != g_Q) {
         if (g_M) cudaFree(g_M); if (g_R) cudaFree(g_R); if (g_SL) cudaFree(g_SL); if (g_Ppad) cudaFree(g_Ppad);

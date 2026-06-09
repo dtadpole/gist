@@ -56,11 +56,14 @@ GIST_CU=~/gist-opt/dir-c-phase4/gist.cu CUDA_VISIBLE_DEVICES=2 ./run_gist.sh <re
 ```
 driver.py sets `harness_weight_inputs: "1,2"`. Algebra: `algorithm.md`.
 
-## Caveat
-Validated on the **big design shape** (the oracle/benchmark shape). The small sanity shape
-(B=8/F=320/Q=64) currently FAILs — branch-B's fused pool (3D-TMA over X, smem sizing) was only validated
-for big; this is independent of the pad-mask change (small has Fp=F=320, no pad cols). Fixable if small
-coverage is needed; the goal/benchmark is big.
+## Shape-robustness (small shape now PASSES too)
+Both the big design shape AND the small sanity shape (B=8/F=320/Q=64) now pass (small: max_abs 0.0156).
+Three big-shape assumptions were generalized (big shape unchanged: Fp=1536, nM=12, Q=128):
+1. **Fp = ceil(F/256)·256** (was ceil(F/64)·64): the padded gate's 256-wide N-tiles must align to q
+   (Fp%256==0, else they cross q-boundaries). F=320→Fp=512; F=1497→1536 (unchanged).
+2. **gate nM = ceil(B/HG_BM)** (was floor): B<128 (e.g. 8) must still emit 1 m-tile (TMA clamps OOB rows).
+3. **pool O-store box = {64, Q}** (was {64, HP_BM=128}): for Q<128 the 128-row M-tile spills into the next
+   batch (computed with the wrong N); storing only the batch's Q rows avoids the racy double-write.
 
 ## Reward-hack audit (PASS)
 Genuine bf16 hand WGMMA gate+pool, real TMA loads of real (bounded-random) weights, full design shape,
