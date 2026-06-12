@@ -52,7 +52,8 @@ e.g. SKIP_GATE 2.52→1.23 confirms the gate is genuinely timed). Buffers trimme
 cd ~/gist/cuda
 CUDA_VISIBLE_DEVICES=2 ./run_gist.sh <rev> big   # BARE: no GIST_CU (uses canonical cuda/gist.cu), no GIST_* flags
 #   -> passed=true, max_abs 0.015625, total ~2.52ms   (the hand Phase-4 path IS the no-env default)
-# verify gate is real:  +GIST_SKIP_GATE=1 -> 1.23ms (correctness breaks); full−skip = gate genuinely timed.
+# the gate-is-real differential (SKIP_GATE 2.52->1.23) is done on the dev copy dir-c-phase4 (keeps the guards);
+# the SHIPPED canonical has NO GIST_* (GIST_SKIP_GATE=1 is a no-op -> still 2.52).
 ```
 driver.py sets `harness_weight_inputs: "1,2"`. Algebra: `algorithm.md`.
 

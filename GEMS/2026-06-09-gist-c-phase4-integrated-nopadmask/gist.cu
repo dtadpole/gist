@@ -2284,12 +2284,11 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     mb = (mb + 127) & ~(size_t)127;
     size_t hgsmem_p = mb + (size_t)2 * HG_BM * HGP_CW * 2;   // ring + double-buffered chunk staging
     int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
-    if (getenv("GIST_SKIP_GATE") == nullptr) {
-        static bool ap = false;
-        if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
-        k_gate_hand_persist<<<numSM, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, QFp, /*dosig=*/1, /*padarg=*/-Fp);
-    }
-    if (getenv("GIST_SKIP_POOL")) return 0;
+    // gate (always run; the GIST_SKIP_GATE/SKIP_POOL guards are stripped from the shipped kernel — a
+    // skip-gate env at measure-time would fake ~1.23ms, so they must not exist in the deliverable).
+    static bool ap = false;
+    if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
+    k_gate_hand_persist<<<numSM, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, QFp, /*dosig=*/1, /*padarg=*/-Fp);
 
     // (3) pool: O = SL . N, with N = X * rrms * W computed INLINE (N never materialized).
     return launch_pool_hand_fused(g_SL, X, GAMMA, O, g_R, B, Q, D, F, Fp, stream);
