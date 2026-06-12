@@ -697,10 +697,9 @@ constexpr int HGP_S = 4, HGP_NCH = 4, HGP_CW = HG_BN / HGP_NCH;
 __global__ __launch_bounds__(384, 1)
 void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                          const __grid_constant__ CUtensorMap tmLc,
-                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp,
-                         int padmask = 1) {
+                         __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
     const int ntiles = nM * nN;
     const int ntK = (F + 63) / 64;
@@ -786,9 +785,9 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                     int lc = 8 * gg + (lane % 4) * 2;
                     float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
                     if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp && padmask) {   // PADDED output to g_SL[B,Q,Fp]: write 0 for the g>=F pad cols.
-                        // REDUNDANT when the fused pool zeros N[g>=F] (X/W 3D-TMA OOB-fill 0 => SL[pad]*N[pad]=0
-                        // regardless of SL[pad]=σ(0)=0.5). GIST_NOPADMASK=1 drops it (-0.14ms). See branch-C.
+                    if (padfp > 0) {   // PADDED output to g_SL[B,Q,Fp]: write 0 for g>=F pad cols.
+                        // (padfp<0 = NOPADMASK A/B: skip — SL[pad] is don't-care since the fused pool's N[g>=F]=0,
+                        //  so SL[pad]*N[pad]=0 regardless. Saves the per-col compare in the epilogue.)
                         int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;   // tile is within one q (Fp%256==0)
                         if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
                         if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
@@ -804,257 +803,6 @@ void k_gate_hand_persist(const __grid_constant__ CUtensorMap tmA, const __grid_c
                 }
             }
             if (tid == 0) tma_store_wait<0>();                 // drain stores before next tile reuses cstg
-        }
-    }
-}
-
-// ===== PHASE 4c: BARRIER-REDUCED gate epilogue (HYPOTHESIS gate-debar) =====
-// NCU (rev88004, mask-off): gate Compute(SM) 78%, Warp Cycles/Issued 10.73; DOMINANT stall = BARRIER 4.88 cyc
-// = 45.5%. σ-offloadable work is tiny (short_scoreboard 0.28 + math_pipe_throttle 0.11 + lg_throttle 0 = 3.6%)
-// -> the EWG σ/store-offload is the WRONG lever (matches flat-EWG = parity). The barrier is the 8 bar.sync(1,256)
-// per output tile in the CHUNKED epilogue (2/chunk x 4). FIX: shrink ring S=4->3 (frees smem) for a 4-buffer cstg
-// (one per chunk, a WHOLE tile of staging), so the epilogue STAGES ALL 4 CHUNKS then does ONE visibility barrier
-// + 4 batched async stores. The per-chunk store-wait barrier is gone (each buffer is reused only a full tile later,
-// long after its store drained during the 24-kiter mainloop; a single tma_store_wait<0> at epilogue entry confirms).
-// 8 barriers/tile -> 2 barriers/tile (4x). smem = 3*6*4096*2 + 4*128*64*2 = 144KB + 64KB = 208KB < 227KB.
-constexpr int HGD_S = 3;   // barrier-reduced ring depth (3 stages free smem for the 4-buffer cstg)
-__global__ __launch_bounds__(384, 1)
-void k_gate_hand_persist_debar(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-                               const __grid_constant__ CUtensorMap tmLc,
-                               __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp,
-                               int padmask) {
-    const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
-    const int nN = (int)((QF + HG_BN - 1) / HG_BN);
-    const int ntiles = nM * nN;
-    const int ntK = (F + 63) / 64;
-    extern __shared__ __align__(128) char hgsm[];
-    __nv_bfloat16* As = (__nv_bfloat16*)hgsm;
-    __nv_bfloat16* Bs = As + HGD_S * HG_MSUB * TILE;
-    uint64_t* full = (uint64_t*)(Bs + HGD_S * HG_NSUB * TILE);   // [HGD_S]
-    uint64_t* empt = full + HGD_S;                               // [HGD_S]
-    __nv_bfloat16* cstg = (__nv_bfloat16*)(((uintptr_t)(empt + HGD_S) + 127) & ~(uintptr_t)127); // [HGP_NCH][HG_BM][HGP_CW]
-    const int Asb = HG_MSUB * TILE, Bsb = HG_NSUB * TILE;
-    const int CB = HG_BM * HGP_CW;                               // one chunk staging buffer (128x64)
-    const unsigned txBytes = (unsigned)((HG_MSUB + HG_NSUB) * 64 * 64 * 2);
-    int tid = threadIdx.x;
-    if (tid == 0) {
-        #pragma unroll
-        for (int s = 0; s < HGD_S; s++) { mbar_init(&full[s], 1); mbar_init(&empt[s], 256); }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
-    __syncthreads();
-
-    if (tid >= 256) {
-        if (tid == 256) {
-            long gk = 0;
-            int pe[HGD_S];
-            #pragma unroll
-            for (int s = 0; s < HGD_S; s++) pe[s] = 0;
-            for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-                int m0 = (ti % nM) * HG_BM; long n0 = (long)(ti / nM) * HG_BN;
-                for (int kt = 0; kt < ntK; kt++) {
-                    int buf = (int)(gk % HGD_S), k0 = kt * 64;
-                    if (gk >= HGD_S) { mbar_wait(&empt[buf], pe[buf]); pe[buf] ^= 1; }
-                    mbar_expect_tx(&full[buf], txBytes);
-                    #pragma unroll
-                    for (int ms = 0; ms < HG_MSUB; ms++)
-                        tma_load_2d(&As[buf * Asb + ms * TILE], &tmA, m0 + ms * 64, k0, &full[buf]);
-                    #pragma unroll
-                    for (int n2 = 0; n2 < HG_NSUB; n2++)
-                        tma_load_2d(&Bs[buf * Bsb + n2 * TILE], &tmB, (int)(n0 + (long)n2 * 64), k0, &full[buf]);
-                    gk++;
-                }
-            }
-        }
-    } else {
-        int wg = tid >> 7, warp = (tid >> 5) & 3, lane = tid & 31;
-        long gk = 0;
-        int pf[HGD_S];
-        #pragma unroll
-        for (int s = 0; s < HGD_S; s++) pf[s] = 0;
-        for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-            int m0 = (ti % nM) * HG_BM; long n0 = (long)(ti / nM) * HG_BN;
-            float acc[HG_NSUB * 32];
-            #pragma unroll
-            for (int i = 0; i < HG_NSUB * 32; i++) acc[i] = 0.f;
-            for (int kt = 0; kt < ntK; kt++) {
-                int buf = (int)(gk % HGD_S);
-                mbar_wait(&full[buf], pf[buf]); pf[buf] ^= 1;
-                wgmma_fenceN(acc, HG_NSUB * 32);
-                cute::warpgroup_arrive();
-                #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
-                    uint64_t da = wg_desc_sw3(&As[buf * Asb + wg * TILE + ks * 1024], 128, 1024);
-                    uint64_t db = wg_desc_sw3(&Bs[buf * Bsb + ks * 1024], 8192, 1024);
-                    wgmma_m64n256k16_AN(acc, da, db, 1);
-                }
-                cute::warpgroup_commit_batch();
-                cute::warpgroup_wait<0>();
-                wgmma_fenceN(acc, HG_NSUB * 32);
-                mbar_arrive(&empt[buf]);
-                gk++;
-            }
-            // ===== BARRIER-REDUCED epilogue: stage ALL 4 chunks (no inter-chunk barrier), 1 visibility barrier,
-            //       4 batched async TMA stores. 1 barrier/tile. The prev tile's 4 stores drained DURING the
-            //       24-kiter mainloop (async TMA 64KB << mainloop time), so the 4 cstg buffers are free without an
-            //       in-loop wait (a concentrated tma_store_wait<0>+barrier here cost 255 threads a big tid0 stall).
-            #pragma unroll
-            for (int c = 0; c < HGP_NCH; c++) {
-                __nv_bfloat16* ch = cstg + c * CB;
-                #pragma unroll
-                for (int gg = 0; gg < HGP_CW / 8; gg++) {
-                    int g = c * (HGP_CW / 8) + gg;
-                    int r0 = wg * 64 + 16 * warp + lane / 4, r1 = r0 + 8;
-                    int lc = 8 * gg + (lane % 4) * 2;
-                    float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
-                    if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp && padmask) {
-                        int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;
-                        if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
-                        if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
-                    }
-                    *(__nv_bfloat162*)&ch[r0 * HGP_CW + lc] = __floats2bfloat162_rn(a0, a1);
-                    *(__nv_bfloat162*)&ch[r1 * HGP_CW + lc] = __floats2bfloat162_rn(b0, b1);
-                }
-            }
-            bar_sync_consumers();                // B2: all staging visible
-            wgmma_async_proxy_fence();           // generic stores -> async-proxy visible
-            if (tid == 0) {
-                #pragma unroll
-                for (int c = 0; c < HGP_NCH; c++) {
-                    tma_store_2d(&tmLc, cstg + c * CB, (int)(n0 + (long)c * HGP_CW), m0);
-                    tma_store_commit();
-                }
-            }
-            // stores stay in flight, overlapped with the next tile's mainloop; drained at next epilogue entry.
-        }
-        if (tid == 0) tma_store_wait<0>();       // drain the final tile's stores before the CTA exits
-    }
-}
-
-// ===== PHASE 4c': PER-WARPGROUP decoupled epilogue (HYPOTHESIS gate-pwg) =====
-// NCU (rev88014): with even a SINGLE balanced visibility barrier the gate's barrier stall is still 3.92 cyc -> the
-// skew is NOT barrier count nor staging imbalance; it's the two consumer WGs reaching any 256-thread bar.sync at
-// DIFFERENT times (they issue wgmma to the same tensor pipe, so they finish offset). WITHIN a WG the 4 warps are
-// synchronized by the collective warpgroup_wait, so a per-WG 128-thread bar.sync has ~0 skew. FIX: each consumer WG
-// owns its 64 output rows end-to-end -- its own [2][64][64] cstg, its own named barrier (id 2+wg, count 128), its
-// own 64-row TMA store at row m0+wg*64 (needs a {64-col,64-row} store map tmSL64). wg0 never waits for wg1. Keeps
-// S=4 ring (no wait regression). smem = 4*6*4096*2 + 2*2*64*64*2 = 192KB + 32KB = 224KB (== baseline).
-__device__ __forceinline__ void bar_sync_wg(int wg) {  // 128-thread named barrier private to one consumer WG
-    asm volatile("bar.sync %0, 128;" :: "r"(2 + wg) : "memory");
-}
-__global__ __launch_bounds__(384, 1)
-void k_gate_hand_persist_pwg(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-                             const __grid_constant__ CUtensorMap tmSL64,
-                             __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig, int padfp,
-                             int padmask) {
-    const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
-    const int nN = (int)((QF + HG_BN - 1) / HG_BN);
-    const int ntiles = nM * nN;
-    const int ntK = (F + 63) / 64;
-    extern __shared__ __align__(128) char hgsm[];
-    __nv_bfloat16* As = (__nv_bfloat16*)hgsm;
-    __nv_bfloat16* Bs = As + HGP_S * HG_MSUB * TILE;
-    uint64_t* full = (uint64_t*)(Bs + HGP_S * HG_NSUB * TILE);   // [HGP_S]
-    uint64_t* empt = full + HGP_S;                               // [HGP_S]
-    __nv_bfloat16* cstg = (__nv_bfloat16*)(((uintptr_t)(empt + HGP_S) + 127) & ~(uintptr_t)127); // [2 wg][2 buf][64][64]
-    const int Asb = HG_MSUB * TILE, Bsb = HG_NSUB * TILE;
-    const int WB = 64 * 64;                                      // per-WG per-buffer staging (64 rows x 64 cols)
-    const unsigned txBytes = (unsigned)((HG_MSUB + HG_NSUB) * 64 * 64 * 2);
-    int tid = threadIdx.x;
-    if (tid == 0) {
-        #pragma unroll
-        for (int s = 0; s < HGP_S; s++) { mbar_init(&full[s], 1); mbar_init(&empt[s], 256); }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
-    __syncthreads();
-
-    if (tid >= 256) {
-        if (tid == 256) {
-            long gk = 0;
-            int pe[HGP_S];
-            #pragma unroll
-            for (int s = 0; s < HGP_S; s++) pe[s] = 0;
-            for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-                int m0 = (ti % nM) * HG_BM; long n0 = (long)(ti / nM) * HG_BN;
-                for (int kt = 0; kt < ntK; kt++) {
-                    int buf = (int)(gk % HGP_S), k0 = kt * 64;
-                    if (gk >= HGP_S) { mbar_wait(&empt[buf], pe[buf]); pe[buf] ^= 1; }
-                    mbar_expect_tx(&full[buf], txBytes);
-                    #pragma unroll
-                    for (int ms = 0; ms < HG_MSUB; ms++)
-                        tma_load_2d(&As[buf * Asb + ms * TILE], &tmA, m0 + ms * 64, k0, &full[buf]);
-                    #pragma unroll
-                    for (int n2 = 0; n2 < HG_NSUB; n2++)
-                        tma_load_2d(&Bs[buf * Bsb + n2 * TILE], &tmB, (int)(n0 + (long)n2 * 64), k0, &full[buf]);
-                    gk++;
-                }
-            }
-        }
-    } else {
-        int wg = tid >> 7, warp = (tid >> 5) & 3, lane = tid & 31;
-        bool wlead = (tid & 127) == 0;        // leader of each WG (tid 0 and tid 128)
-        __nv_bfloat16* wcstg = cstg + wg * 2 * WB;   // this WG's [2 buf][64][64]
-        long gk = 0;
-        int pf[HGP_S];
-        #pragma unroll
-        for (int s = 0; s < HGP_S; s++) pf[s] = 0;
-        for (int ti = blockIdx.x; ti < ntiles; ti += gridDim.x) {
-            int m0 = (ti % nM) * HG_BM; long n0 = (long)(ti / nM) * HG_BN;
-            float acc[HG_NSUB * 32];
-            #pragma unroll
-            for (int i = 0; i < HG_NSUB * 32; i++) acc[i] = 0.f;
-            for (int kt = 0; kt < ntK; kt++) {
-                int buf = (int)(gk % HGP_S);
-                mbar_wait(&full[buf], pf[buf]); pf[buf] ^= 1;
-                wgmma_fenceN(acc, HG_NSUB * 32);
-                cute::warpgroup_arrive();
-                #pragma unroll
-                for (int ks = 0; ks < 4; ks++) {
-                    uint64_t da = wg_desc_sw3(&As[buf * Asb + wg * TILE + ks * 1024], 128, 1024);
-                    uint64_t db = wg_desc_sw3(&Bs[buf * Bsb + ks * 1024], 8192, 1024);
-                    wgmma_m64n256k16_AN(acc, da, db, 1);
-                }
-                cute::warpgroup_commit_batch();
-                cute::warpgroup_wait<0>();
-                wgmma_fenceN(acc, HG_NSUB * 32);
-                mbar_arrive(&empt[buf]);
-                gk++;
-            }
-            // ===== PER-WG chunked epilogue: this WG stages its 64 rows, syncs only its 128 threads, stores its
-            //       own 64-row chunk. No cross-WG rendezvous -> the 4 warps (sync'd by warpgroup_wait) barrier
-            //       with ~0 skew. 2-buf double-buffered per WG (cb=c&1), 64-row async TMA store.
-            #pragma unroll
-            for (int c = 0; c < HGP_NCH; c++) {
-                int cb = c & 1;
-                __nv_bfloat16* ch = wcstg + cb * WB;
-                if (c >= 2 && wlead) tma_store_wait<1>();   // this WG's chunk c-2 store done -> ch free
-                bar_sync_wg(wg);                            // per-WG: 128 threads wait for this WG's leader
-                #pragma unroll
-                for (int gg = 0; gg < HGP_CW / 8; gg++) {
-                    int g = c * (HGP_CW / 8) + gg;
-                    int lr0 = 16 * warp + lane / 4, lr1 = lr0 + 8;   // local row within the WG (0..63)
-                    int lc = 8 * gg + (lane % 4) * 2;
-                    float a0 = acc[4*g+0], a1 = acc[4*g+1], b0 = acc[4*g+2], b1 = acc[4*g+3];
-                    if (dosig) { a0 = sigmoidf(a0); a1 = sigmoidf(a1); b0 = sigmoidf(b0); b1 = sigmoidf(b1); }
-                    if (padfp && padmask) {
-                        int g0 = (int)(n0 % padfp) + c * HGP_CW + lc;
-                        if (g0     >= F) { a0 = 0.f; b0 = 0.f; }
-                        if (g0 + 1 >= F) { a1 = 0.f; b1 = 0.f; }
-                    }
-                    *(__nv_bfloat162*)&ch[lr0 * HGP_CW + lc] = __floats2bfloat162_rn(a0, a1);
-                    *(__nv_bfloat162*)&ch[lr1 * HGP_CW + lc] = __floats2bfloat162_rn(b0, b1);
-                }
-                bar_sync_wg(wg);                            // per-WG staging visible
-                wgmma_async_proxy_fence();
-                if (wlead) {
-                    tma_store_2d(&tmSL64, ch, (int)(n0 + (long)c * HGP_CW), m0 + wg * 64);  // 64-row store
-                    tma_store_commit();
-                }
-            }
-            if (wlead) tma_store_wait<0>();                 // drain this WG's stores before next tile reuses ch
         }
     }
 }
@@ -1079,7 +827,7 @@ void k_gate_hand_persist_ewg(const __grid_constant__ CUtensorMap tmA, const __gr
                              const __grid_constant__ CUtensorMap tmLc,
                              __nv_bfloat16* __restrict__ L, int B, int F, long QF, int dosig) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nN = (int)((QF + HG_BN - 1) / HG_BN);
     const int ntiles = nM * nN;
     const int ntK = (F + 63) / 64;
@@ -1264,7 +1012,7 @@ void k_gate_hand_fused(const __grid_constant__ CUtensorMap tmBp, const __grid_co
                        const __grid_constant__ CUtensorMap tmSL,
                        __nv_bfloat16* __restrict__ SL, int B, int F, int Q, int Fp) {
     const int TILE = 64 * 64;
-    const int nM = B / HG_BM;
+    const int nM = (B + HG_BM - 1) / HG_BM;   // ceil: B<128 (e.g. B=8) must still make 1 m-tile (TMA clamps OOB rows)
     const int nFB = Fp / HG_BN;                       // f-blocks per q (1536/256=6)
     const int nN = Q * nFB;
     const int ntiles = nM * nN;
@@ -1787,7 +1535,8 @@ static int launch_pool_hand_fused(const __nv_bfloat16* SL, const __nv_bfloat16* 
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
         // O = [B*Q, D] store, CHUNKED: {D(fast), B*Q}, box {64,128}, no swizzle (store 3 col-chunks of 64).
         cuuint64_t gdO[2] = {(cuuint64_t)D, (cuuint64_t)B * Q}, gsO[1] = {(cuuint64_t)D * 2};
-        cuuint32_t bxO[2] = {64, HP_BM};
+        cuuint32_t bxO[2] = {64, (cuuint32_t)Q};   // store only this batch's Q rows (Q<HP_BM=128: wg1 computes the
+                                                   // next batch's queries with wrong N -> must NOT be stored, else race)
         cuTensorMapEncodeTiled(&f_tmO, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)O, gdO, gsO, bxO, es2,
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
         f_pSL = SL; f_pX = X; f_pW = W; f_pO = O;
@@ -2472,16 +2221,18 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     int D = env_i("CUDA_EXEC_PARAM_GIST_D", 0), Q = env_i("CUDA_EXEC_PARAM_GIST_Q", 0);
     if (B <= 0 || F <= 0 || D <= 0 || Q <= 0) return 10;
     long QF = (long)Q * F;
-    int Fp = (F + 63) / 64 * 64;              // pad K to a multiple of 64 (fused pool uses a 64-row K-tile)
+    int Fp = (F + 255) / 256 * 256;           // pad features to a multiple of 256: pool K-tile is 64 AND the
+                                              // padded gate's 256-wide N-tiles must align to q (Fp%256==0 ->
+                                              // no q-boundary crossing). Big F=1497 -> 1536 (unchanged).
+    long QFp = (long)Q * Fp;
     if (B != g_B || F != g_F || D != g_D || Q != g_Q) {
-        if (g_M) cudaFree(g_M); if (g_R) cudaFree(g_R); if (g_L) cudaFree(g_L);
-        if (g_N) cudaFree(g_N); if (g_SL) cudaFree(g_SL);
+        if (g_M) cudaFree(g_M); if (g_R) cudaFree(g_R); if (g_SL) cudaFree(g_SL); if (g_Ppad) cudaFree(g_Ppad);
         if (cudaMalloc(&g_M, (size_t)B * F * sizeof(__nv_bfloat16)) != cudaSuccess) return 11;
         if (cudaMalloc(&g_R, (size_t)B * F * 4) != cudaSuccess) return 11;
-        if (cudaMalloc(&g_L, (size_t)B * QF * sizeof(__nv_bfloat16)) != cudaSuccess) return 11;
-        if (cudaMalloc(&g_N, (size_t)B * Fp * D * sizeof(__nv_bfloat16)) != cudaSuccess) return 11;
         if (cudaMalloc(&g_SL, (size_t)B * Q * Fp * sizeof(__nv_bfloat16)) != cudaSuccess) return 11;
-        cudaMemset(g_SL, 0, (size_t)B * Q * Fp * sizeof(__nv_bfloat16));  // zero ONCE: the f in [F,Fp) pad stays 0
+        if (cudaMalloc(&g_Ppad, (size_t)F * QFp * sizeof(__nv_bfloat16)) != cudaSuccess) return 11;
+        cudaMemset(g_SL, 0, (size_t)B * Q * Fp * sizeof(__nv_bfloat16));  // pad cols [F,Fp) stay 0
+        cudaMemset(g_Ppad, 0, (size_t)F * QFp * sizeof(__nv_bfloat16));   // Pp pad cols stay 0
         g_B = B; g_F = F; g_D = D; g_Q = Q;
     }
     // RMSNorm: 3 inputs X[B,F,D], P[F,Q*F], W[F,D] (per-(feature,channel) weight). No beta. GAMMA carries W
@@ -2489,267 +2240,57 @@ extern "C" int kernel_run(__nv_bfloat16** inputs, int num_inputs,
     const __nv_bfloat16 *X = inputs[0], *P = inputs[1], *GAMMA = inputs[2], *BETA = inputs[2];
     __nv_bfloat16* O = outputs[0];
 
-    int warps_per_blk = 8;
-    long stat_warps = ((long)B * Fp + RPW - 1) / RPW;
-    long stat_blocks = (stat_warps + warps_per_blk - 1) / warps_per_blk;
-    // k_stats_mr (vectorized) grid: each warp does 32/STATS_SG rows; block = STATS_WPB warps.
-    long mr_warps = ((long)B * Fp + (32 / STATS_SG) - 1) / (32 / STATS_SG);
+    // ===== GIST forward — fully fused 3-kernel pipeline (the default; no env selectors). =====
+    // stats(M,R) -> gate(sigma(M.Pp) -> padded g_SL) -> pool(O = SL . N, N=X*rrms*W inline).
+    // The repad / separate-sigmoid / materialized-N kernels are all deleted. Only GIST_SKIP_GATE /
+    // GIST_SKIP_POOL remain (component differential timing); everything else is unconditional.
+    long mr_warps  = ((long)B * Fp + (32 / STATS_SG) - 1) / (32 / STATS_SG);
     long mr_blocks = (mr_warps + STATS_WPB - 1) / STATS_WPB;
 
-    // (PADP — gate writes SL_pad directly via column-padded P — was measured SLOWER: 4.27 (Fpad8) /
-    //  4.36 (Fp); the P-pad copy + padded-P gate read cost more than the repad it removes. Removed.)
+    // (1) stats: M = mean_d X, R = rrms (vectorized int4). N is NOT materialized (pool computes it inline).
+    k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
 
-    // MPF path: WMMA fused pool, reads UNPADDED sigmoid'd g_L + computes N inline (stats writes M,R only)
-    if (getenv("GIST_MPF")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
-        if (getenv("GIST_SKIP_GATE") == nullptr) {
-            int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);
-            if (rc != 0) return rc;
-        }
-        if (!getenv("GIST_SKIP_POOL")) {
-            dim3 mpfgrid(B, D / MPF_DPB, Q / MPF_QPB);  // D-split (2) × Q-split (2) = 4 blocks per b
-            k_pool_mpf<<<mpfgrid, 256, 0, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
-        }
-        return 0;
+    // TMA tensor maps (cached on the g_M / P pointers, stable across the L2-flush timed loop):
+    //   A = g_M [B(m,fast), F(k)] col-major;  Bp = g_Ppad [QFp(n,fast), F(k)] row-major;  SL store = g_SL chunk.
+    static CUtensorMap s_tmA, s_tmBp, s_tmSL; static const void* s_pM = nullptr; static const void* s_pP = nullptr;
+    if (g_M != s_pM || (const void*)P != s_pP) {
+        cuuint64_t gdA[2] = {(cuuint64_t)B, (cuuint64_t)F}, gsA[1] = {(cuuint64_t)B * 2};
+        cuuint32_t bxA[2] = {64, 64}, es2[2] = {1, 1};
+        cuTensorMapEncodeTiled(&s_tmA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_M, gdA, gsA, bxA, es2,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuuint64_t gdBp[2] = {(cuuint64_t)QFp, (cuuint64_t)F}, gsBp[1] = {(cuuint64_t)QFp * 2};
+        cuuint32_t bxBp[2] = {64, 64};
+        cuTensorMapEncodeTiled(&s_tmBp, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_Ppad, gdBp, gsBp, bxBp, es2,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuuint64_t gdSL[2] = {(cuuint64_t)QFp, (cuuint64_t)B}, gsSL[1] = {(cuuint64_t)QFp * 2};
+        cuuint32_t bxSL[2] = {HGP_CW, HG_BM};
+        cuTensorMapEncodeTiled(&s_tmSL, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_SL, gdSL, gsSL, bxSL, es2,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        s_pM = g_M; s_pP = (const void*)P;
     }
 
-    // FUSED WGMMA pool path: stats writes ONLY M,R; pool computes N inline + reads sigmoid'd g_L
-    if (getenv("GIST_WGMMA_FUSED")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
-        if (getenv("GIST_SKIP_GATE") == nullptr) {
-            int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);
-            if (rc != 0) return rc;
-        }
-        if (!getenv("GIST_SKIP_POOL")) {
-            dim3 wgrid(B, Q / 64, D / 64);   // + D-tile dim: one n64 tile per block (acc[32], high occ)
-            k_pool_wgmma_fused<<<wgrid, 128, 0, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
-        }
-        return 0;
+    // (0) one-time weight prepack P[F,QF] -> Pp[F,Q*Fp] (cached on the P pointer; the harness holds weights
+    //     constant via CUDA_EXEC_PARAM_HARNESS_WEIGHT_INPUTS, so this runs once and is amortized to ~0).
+    static const void* s_ppsrc = nullptr;
+    if ((const void*)P != s_ppsrc) {
+        k_ppad<<<(unsigned)((long)F * Q), 256, 0, stream>>>(P, g_Ppad, F, Q, QF, QFp, Fp);
+        s_ppsrc = (const void*)P;
     }
 
-    // DIRECTION B: producer/consumer WARP-SPECIALIZED fused wgmma pool (k_pool_ws).
-    if (getenv("GIST_WS")) {
-        k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
-        if (getenv("GIST_SKIP_GATE") == nullptr) {
-            // PROBE (GIST_CUBLAS_GATE): cuBLAS gate (no fused sigmoid — timing-only) vs CUTLASS gate, to
-            // measure whether the gate (the lane-floor bottleneck, 2.42ms iso @14% warps) has a faster path.
-            int rc = getenv("GIST_CUBLAS_GATE") ? run_gate_cublas(g_M, P, g_L, B, F, QF, stream)
-                                                : run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);
-            if (rc != 0) return rc;
-        }
-        if (!getenv("GIST_SKIP_POOL")) {
-            size_t smemBytes = (size_t)(2 * WSB_S) * sizeof(uint64_t)
-                             + (size_t)(2 * Fp + 2 * 64) * sizeof(float)
-                             + (size_t)(WSB_S * 64 * WSB_KT + WSB_S * WSB_KT * 64) * sizeof(__nv_bfloat16);
-            static bool ws_attr_set = false;
-            if (!ws_attr_set) {
-                cudaFuncSetAttribute(k_pool_ws, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemBytes);
-                ws_attr_set = true;
-            }
-            dim3 wsgrid(B, Q / 64, D / 64);
-            k_pool_ws<<<wsgrid, 256, smemBytes, stream>>>(g_L, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
-        }
-        return 0;
-    }
-
-    // HAND-WRITTEN GATE path (Phase 1): k_stats(M,R,N) -> k_gate_hand_b(raw L) -> k_sigpad(sigmoid+pad)
-    // -> CUTLASS pool. Verifies the hand gate (raw logits) via the full O. Gate time via NCU / differential.
-    if (getenv("GIST_HANDGATE")) {
-        if (getenv("GIST_POOLFUSE"))   // Phase 3b: stats writes only M,R (no N); the fused pool computes N inline
-            k_stats_mr<<<mr_blocks, STATS_WPB * 32, 0, stream>>>(X, g_M, g_R, B, F, Fp, D, 1e-5f);
-        else
-            k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
-        if (getenv("GIST_SKIP_GATE") == nullptr) {
-            size_t hgsmem = (size_t)(HG_S * HG_MSUB * 64 * 64 + HG_S * HG_NSUB * 64 * 64) * sizeof(__nv_bfloat16)
-                          + (size_t)(2 * HG_S) * sizeof(uint64_t);
-            static bool hg_attr = false;
-            if (!hg_attr) { cudaFuncSetAttribute(k_gate_hand_b, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem); hg_attr = true; }
-            // TMA tensor maps for A=g_M [B(m,fast),F(k)] col-major & B=P [QF(n,fast),F(k)] row-major (SW128, box 64x64).
-            // Cached on (g_M,P) ptrs (stable across the L2-flush timed loop). OOB box elems zero-filled.
-            static CUtensorMap s_tmA, s_tmB, s_tmBp, s_tmL, s_tmLc, s_tmSL, s_tmSL64; static const void* s_pM = nullptr; static const void* s_pP = nullptr;
-            if (g_M != s_pM || (const void*)P != s_pP) {
-                cuuint64_t gdA[2] = {(cuuint64_t)B, (cuuint64_t)F}, gsA[1] = {(cuuint64_t)B * 2};
-                cuuint32_t bxA[2] = {64, 64}, esA[2] = {1, 1};
-                cuTensorMapEncodeTiled(&s_tmA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_M, gdA, gsA, bxA, esA,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                cuuint64_t gdB[2] = {(cuuint64_t)QF, (cuuint64_t)F}, gsB[1] = {(cuuint64_t)QF * 2};
-                cuuint32_t bxB[2] = {64, 64}, esB[2] = {1, 1};
-                cuTensorMapEncodeTiled(&s_tmB, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)P, gdB, gsB, bxB, esB,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                // PHASE 2 fused gate reads P DIRECTLY (flat-N, s_tmB) & scatters to padded SL on the output
-                // side -> no P repack, so no stale-Pp under the harness's in-place P re-fill.
-                // L output [B, QF] row-major (QF fastest); store-box {HG_BN(col), HG_BM(row)}, no swizzle.
-                cuuint64_t gdL[2] = {(cuuint64_t)QF, (cuuint64_t)B}, gsL[1] = {(cuuint64_t)QF * 2};
-                cuuint32_t bxL[2] = {HG_BN, HG_BM}, esL[2] = {1, 1};
-                cuTensorMapEncodeTiled(&s_tmL, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_L, gdL, gsL, bxL, esL,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                // chunked store box {HGP_CW(col), HG_BM(row)} for the persistent epilogue
-                cuuint32_t bxLc[2] = {HGP_CW, HG_BM};
-                cuTensorMapEncodeTiled(&s_tmLc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_L, gdL, gsL, bxLc, esL,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                // PHASE 2 fast: per-q-padded Pp[F,QFp] (alloc once; refreshed each call on a side stream) -> the
-                // per-q gate B-read col q*Fp+fb*256 is 64-aligned (SW128 legal) and the SL store is aligned async-TMA.
-                long QFp = (long)Q * Fp;
-                if (g_Ppad == nullptr) {
-                    cudaMalloc(&g_Ppad, (size_t)F * QFp * sizeof(__nv_bfloat16));
-                    cudaMemset(g_Ppad, 0, (size_t)F * QFp * sizeof(__nv_bfloat16));  // pad cols [F,Fp) stay 0
-                }
-                cuuint64_t gdBp[2] = {(cuuint64_t)QFp, (cuuint64_t)F}, gsBp[1] = {(cuuint64_t)QFp * 2};
-                cuuint32_t bxBp[2] = {64, 64};
-                cuTensorMapEncodeTiled(&s_tmBp, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_Ppad, gdBp, gsBp, bxBp, esA,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                cuuint64_t gdSL[2] = {(cuuint64_t)QFp, (cuuint64_t)B}, gsSL[1] = {(cuuint64_t)QFp * 2};
-                cuuint32_t bxSL[2] = {HGP_CW, HG_BM};   // store one 64x128 chunk (aligned: q*Fp+fb*256+c*64)
-                cuTensorMapEncodeTiled(&s_tmSL, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_SL, gdSL, gsSL, bxSL, esA,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                cuuint32_t bxSL64[2] = {HGP_CW, 64};    // PWG: per-warpgroup 64-col x 64-row chunk store
-                cuTensorMapEncodeTiled(&s_tmSL64, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)g_SL, gdSL, gsSL, bxSL64, esA,
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-                s_pM = g_M; s_pP = (const void*)P;
-            }
-            size_t mb = (size_t)(HGP_S * (HG_MSUB + HG_NSUB)) * 64 * 64 * 2 + (size_t)(2 * HGP_S) * 8;
-            mb = (mb + 127) & ~(size_t)127;
-            size_t hgsmem_p = mb + (size_t)2 * HG_BM * HGP_CW * 2;   // double-buffered chunk staging
-            int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
-            int pgrid = numSM;
-            if (getenv("GIST_HGGRID")) pgrid = atoi(getenv("GIST_HGGRID"));
-            if (getenv("GIST_GATEPAD")) {
-                // PHASE 4: padded gate. M @ Pp (Pp = per-q-padded P[F,Q*Fp]) -> writes g_SL[B,Q,Fp] DIRECTLY
-                // (σ fused via tanh; pad cols g>=F masked to 0). No repad kernel. ~3% extra compute (N: QF->Q*Fp),
-                // NO remap (Fp=1536 multiple of the 64-col chunk => aligned store). k_ppad once (P is constant).
-                int dosig = getenv("GIST_FUSESIG") ? 1 : 0;
-                static const void* s_ppsrc = nullptr;
-                if (P != s_ppsrc) {                          // one-time weight prepack (harness holds P constant)
-                    k_ppad<<<(unsigned)((long)F * Q), 256, 0, stream>>>(P, g_Ppad, F, Q, QF, (long)Q * Fp, Fp);
-                    s_ppsrc = P;
-                }
-                int pgridp = pgrid;
-                int padmask = getenv("GIST_NOPADMASK") ? 0 : 1;   // pool zeros N[g>=F] => mask redundant (-0.14ms)
-                if (getenv("GIST_GATE_PWG")) {
-                    // PHASE 4c': per-warpgroup decoupled epilogue (S=4 ring, per-WG 64-row store, no cross-WG sync).
-                    static bool aw = false;
-                    if (!aw) { cudaFuncSetAttribute(k_gate_hand_persist_pwg, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); aw = true; }
-                    k_gate_hand_persist_pwg<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL64, g_SL, B, F, (long)Q * Fp, dosig, Fp, padmask);
-                } else if (getenv("GIST_GATE_DEBAR")) {
-                    // PHASE 4c: barrier-reduced epilogue (S=3 ring + 4-buf stage-all, 2 barriers/tile vs 8).
-                    size_t mbd = (size_t)(HGD_S * (HG_MSUB + HG_NSUB)) * 64 * 64 * 2 + (size_t)(2 * HGD_S) * 8;
-                    mbd = (mbd + 127) & ~(size_t)127;
-                    size_t hgsmem_d = mbd + (size_t)HGP_NCH * HG_BM * HGP_CW * 2;   // 4-buffer chunk staging
-                    static bool ad = false;
-                    if (!ad) { cudaFuncSetAttribute(k_gate_hand_persist_debar, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_d); ad = true; }
-                    k_gate_hand_persist_debar<<<pgridp, 384, hgsmem_d, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, Fp, padmask);
-                } else {
-                    static bool ap = false;
-                    if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
-                    k_gate_hand_persist<<<pgridp, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, (long)Q * Fp, dosig, Fp, padmask);
-                }
-            } else if (getenv("GIST_PHASE1RAW")) {
-                // PHASE 1 (raw logits, no fusion): persistent gate -> g_L, then k_sigpad applies sigmoid+pad.
-                int dosig = getenv("GIST_FUSESIG") ? 1 : 0;   // fuse sigmoid into the FAST flat gate (σ(L) -> g_L)
-                if (getenv("GIST_EPIWG")) {
-                    // PHASE 2.s: σ fused via a DEDICATED EPILOGUE WG (overlaps σ+store with consumer wgmma).
-                    // smem: S=3 ring + 4-buffer cstg + mbars (aligned).
-                    size_t mbe = (size_t)(HGE_RING * (HG_MSUB + HG_NSUB)) * 64 * 64 * 2 + (size_t)(2 * HGE_RING) * 8;
-                    mbe = (mbe + 127) & ~(size_t)127;
-                    size_t hgsmem_e = mbe + (size_t)HGE_NCB * HG_BM * HGP_CW * 2 + 128 + (size_t)(2 * HGE_NCB) * 8;
-                    hgsmem_e = (hgsmem_e + 127) & ~(size_t)127;
-                    static bool ae = false;
-                    if (!ae) { cudaFuncSetAttribute(k_gate_hand_persist_ewg, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_e); ae = true; }
-                    int edosig = getenv("GIST_ESKIPSTORE") ? 2 : dosig;   // 2 = DEBUG: σ on E but skip the store
-                    k_gate_hand_persist_ewg<<<pgrid, HGE_TPB, hgsmem_e, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, edosig);
-                } else {
-                    static bool a1 = false;
-                    if (!a1) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); a1 = true; }
-                    k_gate_hand_persist<<<pgrid, 384, hgsmem_p, stream>>>(s_tmA, s_tmB, s_tmLc, g_L, B, F, QF, dosig, 0);
-                }
-            } else {
-                // PHASE 2 (default): FUSED gate -> sigmoid (overlapped on the producer WG) + padded SL directly.
-                // Refresh the per-q-padded Pp on a SIDE STREAM, overlapped with k_stats (one-time weight prepack
-                // in production; the harness re-fills P in place so we refresh -- hidden under stats, ~0 added).
-                if (g_stream2 == nullptr) cudaStreamCreate(&g_stream2);
-                if (g_ev_n == nullptr) cudaEventCreate(&g_ev_n);
-                k_ppad<<<(unsigned)((long)F * Q), 256, 0, g_stream2>>>(P, g_Ppad, F, Q, QF, (long)Q * Fp, Fp);
-                cudaEventRecord(g_ev_n, g_stream2);
-                cudaStreamWaitEvent(stream, g_ev_n, 0);          // gate waits Pp ready (overlapped with stats)
-                size_t mbf = (size_t)(HGF_S * (HG_MSUB + HG_NSUB)) * 64 * 64 * 2 + (size_t)(2 * HGF_S + 4) * 8;
-                mbf = (mbf + 127) & ~(size_t)127;
-                size_t hgsmem_f = mbf + (size_t)2 * HG_BM * HGP_CW * 2;   // DOUBLE-buffered 64-col chunk staging
-                static bool a2 = false;
-                if (!a2) { cudaFuncSetAttribute(k_gate_hand_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_f); a2 = true; }
-                k_gate_hand_fused<<<pgrid, 384, hgsmem_f, stream>>>(s_tmBp, s_tmA, s_tmSL, g_SL, B, F, Q, Fp);
-            }
-        }
-        if (getenv("GIST_PHASE1RAW")) {
-            if (getenv("GIST_FUSESIG"))
-                k_repad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);   // gate ALREADY σ'd -> pad ONLY (no double-σ)
-            else
-                k_sigpad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);  // raw gate -> σ+pad
-        }
-        if (getenv("GIST_DBGSL")) {
-            cudaDeviceSynchronize();
-            __nv_bfloat16 h[24]; long off = 0;  // SL[b=0,q=0,f=0..11] then [b=0,q=0,f=F-2..F+9]
-            cudaMemcpy(h, g_SL + off, 12 * 2, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h + 12, g_SL + (F - 2), 12 * 2, cudaMemcpyDeviceToHost);
-            printf("DBG SL[0,0,0..11]:"); for (int z = 0; z < 12; z++) printf(" %.4f", __bfloat162float(h[z]));
-            printf("\nDBG SL[0,0,F-2..F+9] (pad starts at f=%d):", F); for (int z = 0; z < 12; z++) printf(" %.4f", __bfloat162float(h[12 + z]));
-            printf("\n");
-            __nv_bfloat16 hp[8], hpp[8], hm[8];
-            cudaMemcpy(hp, P, 16, cudaMemcpyDeviceToHost);                 // P[f'=0, n=0..7]
-            if (g_Ppad) cudaMemcpy(hpp, g_Ppad, 16, cudaMemcpyDeviceToHost); else for(int z=0;z<8;z++) hpp[z]=__float2bfloat16(-9.f);
-            for (int z = 0; z < 8; z++) cudaMemcpy(hm + z, g_M + (long)z * B, 2, cudaMemcpyDeviceToHost);  // M[b=0,f'=0..7]=g_M[f'*B]
-            printf("DBG P[0..7]:    "); for (int z=0;z<8;z++) printf(" %.4f", __bfloat162float(hp[z]));
-            printf("\nDBG Pp[0..7]:   "); for (int z=0;z<8;z++) printf(" %.4f", __bfloat162float(hpp[z]));
-            printf("\nDBG M[0,0..7]:  "); for (int z=0;z<8;z++) printf(" %.4f", __bfloat162float(hm[z])); printf("\n");
-            // spread: valid positions should ALL be ~1.0 under the idx correctness fill; find !=1.0 (bug region)
-            long QFp_d = (long)Q * Fp;
-            struct { const char* nm; long off; } sp[] = {
-                {"b0q0f0",0},{"b0q0f256",256},{"b0q0f1024",1024},{"b0q0f1280",1280},{"b0q0f1490",1490},
-                {"b0q1f0",(long)Fp},{"b0q1f1490",(long)Fp+1490},{"b0q64f0",64L*Fp},{"b0q127f0",127L*Fp},{"b0q127f1490",127L*Fp+1490},
-                {"b1q0f0",QFp_d},{"b1q127f0",QFp_d+127L*Fp},{"b1535q0f0",1535L*QFp_d},{"b800q60f700",800L*QFp_d+60L*Fp+700} };
-            printf("DBG spread (valid->~1.0):");
-            for (int z=0;z<14;z++){ __nv_bfloat16 v; cudaMemcpy(&v, g_SL+sp[z].off, 2, cudaMemcpyDeviceToHost); printf(" %s=%.3f", sp[z].nm, __bfloat162float(v)); }
-            printf("\n");
-        }
-        if (getenv("GIST_SKIP_POOL")) return 0;
-        // Phase 2: g_SL is already sigmoid'd + padded by the fused gate (no sigpad/repad).
-        if (getenv("GIST_POOLFUSE")) { int rc = launch_pool_hand_fused(g_SL, X, GAMMA, O, g_R, B, Q, D, F, Fp, stream); if (rc) return rc; return 0; }
-        if (getenv("GIST_POOLHAND")) { int rc = launch_pool_hand(g_SL, g_N, O, B, Q, D, Fp, stream); if (rc) return rc; return 0; }
-        return run_pool(g_SL, g_N, O, B, Q, D, Fp, stream);
-    }
-
-    // DEFAULT path: stats writes M, R, AND N (one X read). (Overlapping N on a 2nd stream was measured
-    // SLOWER — the gate is latency-bound, so a concurrent memory kernel contends for SMs, not free BW.)
-    k_stats<<<stat_blocks, warps_per_blk * 32, 0, stream>>>(X, g_M, g_R, g_N, GAMMA, BETA, B, F, Fp, D, 1e-5f);
-
+    // (2) gate: SL = sigma(M . Pp) -> g_SL[B,Q,Fp] directly. sigma fused (tanh.approx, overlaps the chunked
+    //     store); padded write needs NO remap (Fp=1536 | 256) and NO pad-mask (pool's N[g>=F]=0 makes SL[pad]
+    //     a don't-care, so SL[pad]*N[pad]=0). Persistent warp-specialized WGMMA.
+    size_t mb = (size_t)(HGP_S * (HG_MSUB + HG_NSUB)) * 64 * 64 * 2 + (size_t)(2 * HGP_S) * 8;
+    mb = (mb + 127) & ~(size_t)127;
+    size_t hgsmem_p = mb + (size_t)2 * HG_BM * HGP_CW * 2;   // ring + double-buffered chunk staging
+    int numSM = 132; cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
     if (getenv("GIST_SKIP_GATE") == nullptr) {
-        int rc = run_gate(g_M, P, g_L, B, F, QF, Q, Fp, stream);   // CUTLASS WGMMA gate, sigmoid fused in epilogue (M col-major, K=F)
-        if (rc != 0) return rc;
+        static bool ap = false;
+        if (!ap) { cudaFuncSetAttribute(k_gate_hand_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)hgsmem_p); ap = true; }
+        k_gate_hand_persist<<<numSM, 384, hgsmem_p, stream>>>(s_tmA, s_tmBp, s_tmSL, g_SL, B, F, QFp, /*dosig=*/1, /*padarg=*/-Fp);
     }
     if (getenv("GIST_SKIP_POOL")) return 0;
 
-    if (getenv("GIST_WGMMA_POOL")) {          // hand-written inline-PTX wgmma pool, sigmoid fused (NO sigpad)
-        dim3 wgrid(B, Q / 64);                 // one warpgroup per (batch, q-tile of 64); computes all D (acc[96])
-        k_pool_wgmma<<<wgrid, 128, 0, stream>>>(g_L, g_N, O, B, F, Fp, D, Q);
-        return 0;
-    }
-
-    if (getenv("GIST_WARPSPEC")) {            // sigpad -> SL_pad, then warp-specialized producer/consumer pool
-        k_sigpad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);
-        dim3 wgrid(B, D / WS_DPB);
-        k_pool_warpspec<<<wgrid, 512, 0, stream>>>(g_SL, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
-        return 0;
-    }
-
-    if (getenv("GIST_FUSED_POOL")) {          // sigpad -> SL_pad, then cooperative cp.async fused pool (N inline)
-        k_sigpad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);
-        dim3 fgrid(B, D / DPB);
-        k_pool_fused<<<fgrid, (Q / WM) * DGB * 32, 0, stream>>>(g_SL, X, g_M, g_R, GAMMA, BETA, O, B, F, Fp, D, Q);
-        return 0;
-    }
-
-    // L is already sigmoid(logits) (gate epilogue). Repad-only -> SL[B,Q,Fp] (pad zeroed once at alloc,
-    // so k_repad writes ONLY the F valid columns). No exp, no pad write.
-    k_repad<<<32768, 256, 0, stream>>>(g_L, g_SL, B, Q, F, Fp);
-    if (getenv("GIST_SKIP_POOLGEMM")) return 0;
-    return run_pool(g_SL, g_N, O, B, Q, D, Fp, stream);
+    // (3) pool: O = SL . N, with N = X * rrms * W computed INLINE (N never materialized).
+    return launch_pool_hand_fused(g_SL, X, GAMMA, O, g_R, B, Q, D, F, Fp, stream);
 }
